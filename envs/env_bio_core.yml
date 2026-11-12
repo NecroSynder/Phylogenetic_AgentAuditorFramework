@@ -1,0 +1,28 @@
+name: env_bio_core
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11.9
+  - iqtree
+  - raxml-ng
+  - fasttree
+  - numpy<2.0
+  - scipy
+  - pandas
+  - biopython
+  - dendropy
+  - scikit-bio
+  - pytest
+  - pip
+  - pip:
+      - ete3
+      - six
+      - lxml
+      - pyvcf3
+      - pydantic>=2.5
+      - langgraph>=0.2
+      - langchain-core
+      - langchain-openai
+      - statsmodels
