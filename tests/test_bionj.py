@@ -12,7 +12,9 @@ normalizer (manuscript Section 4.1.1, item 4, Phyloformer Normalization).
 import random
 import shutil
 import subprocess
+import sys
 from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -22,7 +24,7 @@ from skbio.stats.distance import DissimilarityMatrixError  # parent of DistanceM
 
 from src.preprocessing.normalizer_wrapper import distance_matrix_to_bionj_newick
 
-FASTME = shutil.which("fastme")
+FASTME = shutil.which("fastme", path=str(Path(sys.executable).parent)) or shutil.which("fastme")
 requires_fastme = pytest.mark.skipif(
     FASTME is None, reason="FastME not installed (conda install -c bioconda fastme)"
 )

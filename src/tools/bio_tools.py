@@ -85,7 +85,9 @@ def extract_branch_synapomorphies(
     parent_node_id: str,
     child_node_id: str
 ) -> list[dict]:
-    df = pd.read_csv(asr_state_path, sep="\t")
+    df = pd.read_csv(asr_state_path, sep="\t", keep_default_na=False)
+    if "is_indel" in df.columns:
+        df["is_indel"] = df["is_indel"].apply(lambda x: str(x).lower() == "true" if not isinstance(x, bool) else x)
     sub = df[(df["parent_node"] == parent_node_id) & (df["child_node"] == child_node_id)]
     if sub.empty:
         sub = df[df["child_node"] == child_node_id]
@@ -109,11 +111,14 @@ def diagnose_evolutionary_stressor(
     mean_ri = a_true["mean_alignment_ri"]
     rho_lba = a_true["global_rho_lba"]
     gap_pct = a_true["mean_gap_density_pct"]
+    recomb_overlap = bool(a_true.get("recombination_breakpoints"))
 
     if rho_lba >= 5.0 and mean_ci < 0.5:
         artifact = "SHORT_BRANCH_HOMOPLASY_AND_LBA" if branch_len < 0.005 else "LBA"
     elif gap_pct >= 15.0:
         artifact = "INDEL_GAP"
+    elif recomb_overlap:
+        artifact = "RECOMBINATION"
     elif branch_len < 0.005 or mean_ci < 0.5:
         artifact = "SHORT_BRANCH_HOMOPLASY"
     else:
@@ -124,7 +129,7 @@ def diagnose_evolutionary_stressor(
         "mean_ri": mean_ri,
         "lba_branch_ratio": rho_lba,
         "gap_density_pct": gap_pct,
-        "recombination_window_overlap": False,
+        "recombination_window_overlap": recomb_overlap,
         "primary_artifact": artifact
     }
 
@@ -136,20 +141,34 @@ def inspect_alignment_window(
     end_pos: int
 ) -> dict:
     alignment = AlignIO.read(fasta_path, "fasta")
+    sub_records = [rec for rec in alignment if rec.id in taxa_subset]
+    if not sub_records:
+        sub_records = list(alignment)
+
     sub_seqs = {
         rec.id: str(rec.seq[start_pos - 1 : end_pos])
-        for rec in alignment if rec.id in taxa_subset
+        for rec in sub_records
     }
     entropies = []
+    gap_pcts = []
+    n_sub = len(sub_records)
     for col_i in range(start_pos - 1, end_pos):
-        col_chars = [rec.seq[col_i] for rec in alignment if rec.id in taxa_subset]
+        col_chars = [rec.seq[col_i] for rec in sub_records]
+        gap_pct_col = round((col_chars.count("-") / n_sub) * 100.0, 2)
+        gap_pcts.append(gap_pct_col)
+
         _, counts = np.unique(col_chars, return_counts=True)
-        probs = counts / len(col_chars)
-        entropies.append(-np.sum(probs * np.log2(probs)))
+        probs = counts / n_sub
+        entropies.append(round(float(-np.sum(probs * np.log2(probs))), 4))
 
     return {
         "window_slice": sub_seqs,
-        "mean_shannon_entropy_bits": round(float(np.mean(entropies)), 4) if entropies else 0.0
+        "start_pos": start_pos,
+        "end_pos": end_pos,
+        "column_conservation_entropy_bits": entropies,
+        "column_gap_percentages": gap_pcts,
+        "mean_shannon_entropy_bits": round(float(np.mean(entropies)), 4) if entropies else 0.0,
+        "mean_gap_density_pct": round(float(np.mean(gap_pcts)), 2) if gap_pcts else 0.0
     }
 
 # Tool 5: verify_claim_coordinates
@@ -160,21 +179,26 @@ def verify_claim_coordinates(
 ) -> dict:
     alignment = AlignIO.read(fasta_path, "fasta")
     seq_len = alignment.get_alignment_length()
-    asr_df = pd.read_csv(asr_state_path, sep="\t")
+    asr_df = pd.read_csv(asr_state_path, sep="\t", keep_default_na=False)
     valid_tuples = set(zip(asr_df["site"], asr_df["parent_state"], asr_df["child_state"]))
+    indel_sites = set(asr_df[asr_df["is_indel"].astype(str).str.lower() == "true"]["site"]) if "is_indel" in asr_df.columns else set()
 
     mismatched = []
     for claim in draft_claims:
-        site = int(claim.get("site_coordinate", -1))
-        s_u = str(claim.get("ancestral_state", ""))
-        s_v = str(claim.get("derived_state", ""))
+        site = int(claim.get("site_coordinate", claim.get("site", -1)))
+        s_u = str(claim.get("ancestral_state", claim.get("parent_state", "")))
+        s_v = str(claim.get("derived_state", claim.get("child_state", "")))
 
         if site < 1 or site > seq_len:
             mismatched.append({**claim, "reason": "Coordinate out of alignment bounds"})
             continue
 
         col_states = set(alignment[:, site - 1])
-        if (site, s_u, s_v) not in valid_tuples and (s_u not in col_states or s_v not in col_states):
+        is_valid_asr = (site, s_u, s_v) in valid_tuples
+        is_valid_leaf = (s_u in col_states and s_v in col_states)
+        is_valid_indel = (site in indel_sites and "-" in col_states and ("-" in {s_u, s_v}))
+
+        if not (is_valid_asr or is_valid_leaf or is_valid_indel):
             mismatched.append({**claim, "reason": "Character states mismatch FASTA/ASR ground truth"})
 
     return {
