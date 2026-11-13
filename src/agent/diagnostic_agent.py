@@ -447,6 +447,11 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
 
     if (not ver_res["all_verified"]) and retry_count < max_retries:
         # Reject hallucinated draft and trigger re-generation constrained to tool dictionary
+        nid_alert = state["current_node"]["node_id"]
+        print(
+            f"  [State 4 Verification Gate] Node {nid_alert}: Blocked unverified coordinate claim(s) "
+            f"{ver_res.get('mismatched_claims', [])} (Attempt {retry_count + 1}/{max_retries}) -> Self-correcting..."
+        )
         return {
             "draft_claims": draft_claims,
             "draft_explanation": draft_explanation,
@@ -538,6 +543,7 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
             feature_f1=f1_score,
             information_gain_ig=ig_local,
             faithfulness_fgs=fgs_local,
+            verification_retries=retry_count,
         ),
         node_goodness_score=g_node,
         causal_sequence_evidence=evidence_list,
@@ -608,6 +614,9 @@ def finalize_audit_report(state: DiagnosticAgentState) -> dict:
 
     lcr_score = compute_lcr(node_audits, state["pred_newick_path"])
     g_tree = compute_tree_goodness(node_audits, state["asr_state_path"], lcr_score)
+    total_retries = sum(
+        int(n["explanation_quality_vector"].get("verification_retries", 0)) for n in node_audits
+    )
 
     report_obj = AuditReport(
         audit_metadata=AuditMetadata(
@@ -622,6 +631,7 @@ def finalize_audit_report(state: DiagnosticAgentState) -> dict:
             false_confidence_index_fci=float(topo["fci_global"]),
             total_internal_nodes_audited=len(node_audits),
             false_confidence_nodes_count=int(topo["false_confidence_nodes_count"]),
+            total_hallucination_retries_triggered=total_retries,
             claim_to_coordinate_verification_rate=global_ccvr,
             logical_consistency_rate_lcr=lcr_score,
             overall_tree_goodness_score=g_tree,

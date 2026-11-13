@@ -4,6 +4,7 @@
 # For user data
 data/
 *.ini
+PROGRESS_PRESENTATION.md
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/

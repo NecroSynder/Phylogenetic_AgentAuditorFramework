@@ -146,9 +146,11 @@ def test_state_4_verification_gate_blocks_hallucination_and_self_corrects():
     )
 
     assert attempt_counter["calls"] == 13  # Called once per node on attempt 0, then rejected & corrected on retry 1
+    assert report["global_metrics"]["total_hallucination_retries_triggered"] == 13
     assert report["global_metrics"]["claim_to_coordinate_verification_rate"] == 1.0
     for node_rec in report["node_audits"]:
         assert node_rec["explanation_quality_vector"]["ccvr_local"] == 1.0
+        assert node_rec["explanation_quality_vector"]["verification_retries"] == 1
         assert all(ev["site_coordinate"] != 9999 for ev in node_rec["causal_sequence_evidence"])
 
 

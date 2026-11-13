@@ -13,6 +13,7 @@ class GlobalMetrics(BaseModel):
     false_confidence_index_fci: float = Field(..., ge=0.0, le=1.0)
     total_internal_nodes_audited: int
     false_confidence_nodes_count: int
+    total_hallucination_retries_triggered: int = Field(default=0, ge=0)
     claim_to_coordinate_verification_rate: float = Field(..., ge=0.0, le=1.0)
     logical_consistency_rate_lcr: float = Field(..., ge=0.0, le=1.0)
     overall_tree_goodness_score: float = Field(..., ge=0.0, le=1.0)
@@ -28,6 +29,7 @@ class ExplanationQualityVector(BaseModel):
     feature_f1: float = Field(..., ge=0.0, le=1.0)
     information_gain_ig: float = Field(..., ge=0.0, le=1.0)
     faithfulness_fgs: float = Field(..., ge=0.0, le=1.0)
+    verification_retries: int = Field(default=0, ge=0)
 
 class CausalSequenceEvidence(BaseModel):
     site_coordinate: int = Field(..., ge=1)
