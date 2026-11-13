@@ -152,31 +152,31 @@ This audits all 13 internal nodes (`N1..N13`) and writes the validated report to
 #### 1. Generate Synthetic Alignments & Ground Truths
 * **Quick Smoke Test (3 datasets):**
   ```bash
-  /home/neal/miniconda3/envs/env_bio_core/bin/python scripts/generate_synthetic_benchmarks.py \
+  /home/<USER>/miniconda3/envs/env_bio_core/bin/python scripts/generate_synthetic_benchmarks.py \
     --quick-smoke \
     --compute-ground-truths
   ```
 * **Full Production Benchmark Grid (Tier 1 & Tier 2):**
   ```bash
-  /home/neal/miniconda3/envs/env_bio_core/bin/python scripts/generate_synthetic_benchmarks.py \
+  /home/<USER>/miniconda3/envs/env_bio_core/bin/python scripts/generate_synthetic_benchmarks.py \
     --tier both \
     --replicates 1 \
     --seq-type DNA \
     --compute-ground-truths
   ```
-  * **Tier 1** simulates $N \in \{15, 30, 40, 50\}$, $L = 1000$, Zipfian indels ($L_{\text{gap}} \in [1, 30]$) at gap proportions $G \in \{5\%, 15\%, 30\%\}$, and LBA terminal branch multipliers $k \in \{2, 10, 40\}$.
-  * **Tier 2** simulates $N \in \{50, 100, 200\}$, $L \in \{1000, 2000\}$, short internal radiation branches ($\ell_{\text{int}} = 0.002 < 0.005$), extreme gamma rate heterogeneity ($\alpha = 0.2$), and a localized $15\%$ recombinant block swap.
+  * **Tier 1** simulates $N \in \lbrace 15, 30, 40, 50 \rbrace$, $L = 1000$, Zipfian indels ($L_{\text{gap}} \in [1, 30]$) at gap proportions $G \in \lbrace 5\\%, 15\\%, 30\\% \rbrace$, and LBA terminal branch multipliers $k \in \lbrace 2, 10, 40 \rbrace$.
+  * **Tier 2** simulates $N \in \lbrace 50, 100, 200 \rbrace$, $L \in \lbrace 1000, 2000 \rbrace$, short internal radiation branches ($\ell_{\text{int}} = 0.002 < 0.005$), extreme gamma rate heterogeneity ($\alpha = 0.2$), and a localized 15% recombinant block swap.
   * Outputs raw FASTAs to `data/01_raw_alignments/` and ground truths (`T_true_rooted.nwk`, `M_true.tsv`, `A_true.json`) to `data/02_ground_truths/`.
 
 #### 2. Run Target Models (`Fusang`, `Phyloformer`) & Classical Baselines
 ```bash
-/home/neal/miniconda3/envs/env_bio_core/bin/python scripts/run_target_models.py \
+/home/<USER>/miniconda3/envs/env_bio_core/bin/python scripts/run_target_models.py \
   --models Fusang Phyloformer IQ-TREE2 RAxML-NG FastTree2 \
   --bootstraps 100
 ```
 * Automatically skips `Fusang` when $N > 40$.
 * Converts `Phyloformer` $N \times N$ distance matrices into trees via validated **BIONJ** (`distance_matrix_to_bionj_newick`).
-* Applies **Rule 1** (Outgroup rooting), **Rule 2** (Post-order `N1..Nk` indexing), and **Rule 3** ($[0, 100\%]$ support mapping & unit branch lengths `1.0` for `Fusang`) into `data/03_standardized_trees/`.
+* Applies **Rule 1** (Outgroup rooting), **Rule 2** (Post-order `N1..Nk` indexing), and **Rule 3** ($[0, 100\\%]$ support mapping & unit branch lengths `1.0` for `Fusang`) into `data/03_standardized_trees/`.
 
 ---
 
@@ -188,7 +188,7 @@ For real-world biological alignments (**TreeBASE** fungal/plant loci, **OrthoMaM
 > **Note (Tier 3 Compatibility Only):** This sanitizer is **only** for external real-world FASTA files downloaded from public databases (which often contain spaces, colons, parentheses, `?`/`.` gap symbols, or 100%-gap columns that crash Newick/FASTA parsers). It is **not** needed for Tier 1 or Tier 2 synthetic benchmarks.
 
 ```bash
-/home/neal/miniconda3/envs/env_bio_core/bin/python scripts/sanitize_tier3_fasta.py \
+/home/<USER>/miniconda3/envs/env_bio_core/bin/python scripts/sanitize_tier3_fasta.py \
   --input-fasta /path/to/downloaded_raw_database_file.fasta \
   --output-fasta data/01_raw_alignments/tier3/My_Empirical_Dataset/alignment.fa \
   --outgroup Designated_Outgroup_Taxon
@@ -197,7 +197,7 @@ This outputs a clean `data/01_raw_alignments/tier3/My_Empirical_Dataset/alignmen
 
 #### 2. Build the 3-Engine Consensus Silver Standard (`IQ-TREE 2` + `RAxML-NG` + `FastTree 2`)
 ```bash
-/home/neal/miniconda3/envs/env_bio_core/bin/python scripts/prepare_empirical_tier3.py \
+/home/<USER>/miniconda3/envs/env_bio_core/bin/python scripts/prepare_empirical_tier3.py \
   --fasta data/01_raw_alignments/tier3/My_Empirical_Dataset/alignment.fa \
   --dataset-id My_Empirical_Dataset \
   --outgroup Designated_Outgroup_Taxon \
@@ -209,7 +209,7 @@ This outputs a clean `data/01_raw_alignments/tier3/My_Empirical_Dataset/alignmen
 
 #### 3. Run `Fusang` and `Phyloformer` on the Empirical FASTA
 ```bash
-/home/neal/miniconda3/envs/env_bio_core/bin/python scripts/run_target_models.py \
+/home/<USER>/miniconda3/envs/env_bio_core/bin/python scripts/run_target_models.py \
   --fasta data/01_raw_alignments/tier3/My_Empirical_Dataset/alignment.fa \
   --dataset-id My_Empirical_Dataset \
   --outgroup Designated_Outgroup_Taxon \
@@ -224,7 +224,7 @@ This outputs a clean `data/01_raw_alignments/tier3/My_Empirical_Dataset/alignmen
 To evaluate the **Proposed 4-State Diagnostic Agent** against **AI Baseline 1 (Zero-Shot LLM)** and **AI Baseline 2 (Generic Unconstrained Agent)** on any dataset:
 
 ```bash
-/home/neal/miniconda3/envs/env_bio_core/bin/python scripts/run_ai_baselines.py \
+/home/<USER>/miniconda3/envs/env_bio_core/bin/python scripts/run_ai_baselines.py \
   --dataset-id TOY_DEV_15TAXA \
   --target-model Fusang \
   --fasta data/00_golden_toy/toy_alignment.fa \
@@ -258,10 +258,10 @@ Each auditor method writes its own isolated JSON report so results never overwri
 | Metric | Symbol | Range | What It Measures |
 | :--- | :--- | :--- | :--- |
 | **Normalized Robinson-Foulds** | $\text{RF}_{\text{norm}}$ | $[0, 1]$ | Global topological error between $T_{\text{pred}}$ and $T_{\text{true}}$ ($0.0 =$ identical topologies). |
-| **False-Confidence Index** | $\text{FCI}$ | $[0, 1]$ | Fraction of high-support splits ($\ge 85\%$) that are topologically wrong (hallucinated clades). |
+| **False-Confidence Index** | $\text{FCI}$ | $[0, 1]$ | Fraction of high-support splits ($\ge 85\\%$) that are topologically wrong (hallucinated clades). |
 | **Error Detection Rate** | $\text{EDR}$ | $[0, 1]$ | Recall of the auditor in flagging true topological errors and their underlying stressor. |
 | **Claimed-Coordinate Verification Rate** | $\text{CCVR}$ | $[0, 1]$ | Fraction of cited `(site, ancestral_state, derived_state)` claims verified in `M_true.tsv` and `alignment.fa`. |
-| **Bootstrap Support Fidelity** | $\text{BSF}$ | $\{0, 1\}$ | Binary gate checking whether the text's confidence phrasing matches $\phi(\text{Support}(b_k))$ (`Low`, `Moderate`, `Definitive/High`). |
+| **Bootstrap Support Fidelity** | $\text{BSF}$ | $\lbrace 0, 1 \rbrace$ | Binary gate checking whether the text's confidence phrasing matches $\phi(\text{Support}(b_k))$ (`Low`, `Moderate`, `Definitive/High`). |
 | **Site Identification F1** | $\text{F1}(b_k)$ | $[0, 1]$ | Harmonic mean of Precision and Recall of cited synapomorphic/homoplastic columns vs. `M_true.tsv`. |
 | **Bayesian Transition Info Gain** | $\text{IG}(b_k)$ | $[0, 1]$ | Proportion of branch site-log-likelihood support ($\Delta\text{SLS}_i$) captured by the agent's cited coordinates, paired with CTMC transition log-likelihood $\log P(\ell_k)$ and Shannon entropy reduction (bits). |
 | **Faithfulness / Grounding Score** | $\text{FGS}(b_k)$ | $[0, 1]$ | Fraction of atomic clauses in the explanation entailed by the deterministic tool outputs $\mathcal{O}_{\text{tools}}(b_k)$. |
