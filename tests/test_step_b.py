@@ -6,9 +6,42 @@ Unit tests for Step B:
 import json
 from pathlib import Path
 
+from scripts.sanitize_tier3_fasta import sanitize_tier3_empirical_fasta
 from src.preprocessing.empirical_consensus import build_empirical_tier3_ground_truth
 from src.preprocessing.synthetic_generator import generate_single_synthetic_dataset
 from src.preprocessing.target_model_runner import run_target_model_pipeline
+
+
+def test_tier3_fasta_compatibility_sanitizer(tmp_path: Path) -> None:
+    raw_messy = tmp_path / "messy_ncbi.fasta"
+    clean_out = tmp_path / "tier3_clean" / "alignment.fa"
+
+    # Raw FASTA with Newick-breaking punctuation, lowercase, U bases, ?/. gaps, and a 100%-gap column (col 4)
+    raw_messy.write_text(
+        ">Outgroup:Bat_CoV (RaTG13) isolate=1\n"
+        "acgu-A\n"
+        ">SARS-CoV-2 (Wuhan:2019), strain A\n"
+        "acgt-A\n"
+        ">SARS-CoV-2 (XBB.1.5); recombinant\n"
+        "acg.-C\n"
+        ">SARS-CoV-2 [BA.2] variant\n"
+        "acg?-C\n"
+    )
+
+    summary = sanitize_tier3_empirical_fasta(
+        input_fasta_path=str(raw_messy),
+        output_fasta_path=str(clean_out),
+        outgroup="Outgroup:Bat_CoV",
+    )
+
+    assert clean_out.exists()
+    assert summary["purpose"] == "Tier 3 Empirical Biological FASTA Compatibility Pre-Processing Only"
+    assert summary["n_taxa"] == 4
+    assert summary["original_alignment_length"] == 6
+    assert summary["removed_all_gap_columns"] == 1
+    assert summary["final_alignment_length"] == 5
+    assert summary["requested_outgroup_found"] is True
+    assert summary["recommended_outgroup"] == "Outgroup_Bat_CoV"
 
 
 def test_empirical_tier3_three_engine_consensus(tmp_path: Path) -> None:

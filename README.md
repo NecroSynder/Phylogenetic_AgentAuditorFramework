@@ -83,6 +83,7 @@ SP_Env/
 │       └── audit_schema.py                # Strict Pydantic v2 schema for JSON audit reports
 ├── scripts/
 │   ├── generate_synthetic_benchmarks.py   # CLI: Generate Tier 1 & Tier 2 synthetic stressor datasets
+│   ├── sanitize_tier3_fasta.py            # CLI: [Tier 3 Compatibility Only] Clean raw NCBI/TreeBASE/OrthoMaM FASTAs
 │   ├── prepare_empirical_tier3.py         # CLI: Build Tier 3 3-engine consensus from real FASTAs
 │   ├── run_target_models.py               # CLI: Run Fusang, Phyloformer, IQ-TREE2, RAxML-NG, FastTree2
 │   ├── run_live_agent_audit.py            # CLI: Run single live agent audit via LM Studio
@@ -183,11 +184,16 @@ This audits all 13 internal nodes (`N1..N13`) and writes the validated report to
 
 For real-world biological alignments (**TreeBASE** fungal/plant loci, **OrthoMaM v12** vertebrate exons, or **SARS-CoV-2 / HIV-1** viral recombinants):
 
-#### 1. Place Your Aligned FASTA in `data/01_raw_alignments/tier3/`
-Ensure FASTA taxon headers use clean alphanumeric/underscore names (e.g., `>Taxon_Name`) and all sequences have equal aligned length $L$:
-```text
-data/01_raw_alignments/tier3/My_Empirical_Dataset/alignment.fa
+#### 1. Sanitize Your Downloaded FASTA for Tier 3 Compatibility (`sanitize_tier3_fasta.py`)
+> **Note (Tier 3 Compatibility Only):** This sanitizer is **only** for external real-world FASTA files downloaded from public databases (which often contain spaces, colons, parentheses, `?`/`.` gap symbols, or 100%-gap columns that crash Newick/FASTA parsers). It is **not** needed for Tier 1 or Tier 2 synthetic benchmarks.
+
+```bash
+/home/neal/miniconda3/envs/env_bio_core/bin/python scripts/sanitize_tier3_fasta.py \
+  --input-fasta /path/to/downloaded_raw_database_file.fasta \
+  --output-fasta data/01_raw_alignments/tier3/My_Empirical_Dataset/alignment.fa \
+  --outgroup Designated_Outgroup_Taxon
 ```
+This outputs a clean `data/01_raw_alignments/tier3/My_Empirical_Dataset/alignment.fa` plus `alignment_tier3_sanitized_report.json` mapping original database headers to clean taxon IDs.
 
 #### 2. Build the 3-Engine Consensus Silver Standard (`IQ-TREE 2` + `RAxML-NG` + `FastTree 2`)
 ```bash
