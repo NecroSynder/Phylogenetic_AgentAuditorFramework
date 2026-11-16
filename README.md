@@ -82,6 +82,7 @@ SP_Env/
 │   └── schemas/
 │       └── audit_schema.py                # Strict Pydantic v2 schema for JSON audit reports
 ├── scripts/
+│   ├── run_full_pipeline.py               # CLI: [MASTER RUNNER] Executes Steps 1 -> 2 -> 3 -> 4 in one command
 │   ├── generate_synthetic_benchmarks.py   # CLI: Generate Tier 1 & Tier 2 synthetic stressor datasets
 │   ├── sanitize_tier3_fasta.py            # CLI: [Tier 3 Compatibility Only] Clean raw NCBI/TreeBASE/OrthoMaM FASTAs
 │   ├── prepare_empirical_tier3.py         # CLI: Build Tier 3 3-engine consensus from real FASTAs
@@ -130,13 +131,19 @@ conda activate env_bio_core
 
 ## 5. Quick Start: Running Tests & Smoke Audit
 
-### 5.1 Run the Full Automated Test Suite (30 Tests)
+### 5.1 Run the Full Automated Test Suite (32 Tests)
 Verify that all 4 pipeline steps, BIONJ, synthetic generators, empirical consensus, and evaluation metrics pass:
 ```bash
-/home/<USER>/miniconda3/envs/env_bio_core/bin/pytest -v
+pytest -v --disable-warnings
 ```
 
-### 5.2 Run a Live Single-Tree Audit Connected to LM Studio
+### 5.2 Run the Entire 4-Step Pipeline in One Command (`run_full_pipeline.py`)
+Execute `[Step 1/4] Ground Truth -> [Step 2/4] Model Inference & Rules 1-3 -> [Step 3/4] 4-State Agent -> [Step 4/4] 3-Way Statistical Comparison` end-to-end with one command:
+```bash
+python scripts/run_full_pipeline.py --dataset-id TOY_DEV_15TAXA --target-model Fusang
+```
+
+### 5.3 Run a Live Single-Tree Audit Connected to LM Studio
 With LM Studio running on `http://localhost:1234/v1`, run the 4-State Agent on the 15-taxon Golden Toy dataset:
 ```bash
 /home/<USER>/miniconda3/envs/env_bio_core/bin/python scripts/run_live_agent_audit.py

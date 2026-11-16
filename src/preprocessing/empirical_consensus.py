@@ -241,14 +241,14 @@ def build_empirical_tier3_ground_truth(
     consensus_nwk_path.write_text(eng_res["iqtree_newick"] + "\n")
 
     # Run Pipeline Step 1 on the consensus reference tree to produce T_true_rooted.nwk, M_true.tsv, A_true.json
-    if seq_type.upper() == "DNA":
-        run_ground_truth_pipeline(
-            fasta_path=str(fasta_path),
-            true_tree_path=str(consensus_nwk_path),
-            out_dir=str(out_path),
-            outgroup=chosen_outgroup,
-            recombination_breakpoints=recombination_breakpoints or [],
-        )
+    run_ground_truth_pipeline(
+        fasta_path=str(fasta_path),
+        true_tree_path=str(consensus_nwk_path),
+        out_dir=str(out_path),
+        outgroup=chosen_outgroup,
+        recombination_breakpoints=recombination_breakpoints or [],
+        auto_scan_recombination=(not bool(recombination_breakpoints)),
+    )
 
     total_internal = len(iq_clades)
     concordant_count = len(consensus_clades)

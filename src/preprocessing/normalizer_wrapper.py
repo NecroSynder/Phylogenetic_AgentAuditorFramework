@@ -1,3 +1,28 @@
+"""
+================================================================================
+PIPELINE STEP 2: PRE-PROCESSING & OUTPUT NORMALIZATION WRAPPER
+(Manuscript Section 4.1.1, Item 4 & Pages 11, 14)
+================================================================================
+Unifies the heterogeneous native outputs of Fusang (<= 40 taxa, branchless
+topologies) and Phyloformer (> 40 taxa, NxN pairwise distance matrices) into a
+single standardized Newick + JSON representation before passing to the Agent:
+
+  1. Non-Parametric Bootstrap Resampler (generate_bootstrap_replicates):
+     - Samples L alignment columns with replacement B = 100 times via NumPy.
+
+  2. Phyloformer BIONJ Agglomerative Converter (distance_matrix_to_bionj_newick):
+     - Validates NxN distance matrices via scikit-bio DistanceMatrix (Aton et al., 2025).
+     - Applies Gascuel (1997) variance-minimizing BIONJ updates (validated against
+       FastME; Lefort et al., 2015) and clamps negative branches to epsilon = 1e-6.
+
+  3. Tree & Support Normalizer — Rules 1, 2 & 3 (standardize_and_root_tree):
+     - Rule 1: Universal Outgroup Rooting via ETE 3 (tree.set_outgroup(outgroup)).
+     - Rule 2: Deterministic Post-Order Node Indexing (N1, N2, ..., Nk) and
+               sorted leaf-set bipartition signatures.
+     - Rule 3: Maps empirical bootstrap split frequencies Support(b) in [0%, 100%]
+               via DendroPy (Sukumaran & Holder, 2010) and assigns placeholder unit
+               branch lengths (l_k = 1.0) with "branch_lengths_present": false for Fusang.
+"""
 import json
 from pathlib import Path
 import numpy as np
@@ -9,8 +34,18 @@ from Bio.Align import MultipleSeqAlignment
 from ete3 import Tree
 from skbio import DistanceMatrix
 
-def generate_bootstrap_replicates(fasta_path: str, out_dir: str, b_replicates: int = 100, seed: int = 42) -> list[str]:
-    """Samples L alignment columns with replacement using NumPy (B=100)."""
+
+# ==============================================================================
+# SECTION 1: NON-PARAMETRIC BOOTSTRAP RESAMPLER (B = 100 REPLICATES)
+# ==============================================================================
+
+def generate_bootstrap_replicates(
+    fasta_path: str,
+    out_dir: str,
+    b_replicates: int = 100,
+    seed: int = 42,
+) -> list[str]:
+    """Samples L alignment columns with replacement using NumPy (B = 100 replicates)."""
     rng = np.random.default_rng(seed)
     alignment = AlignIO.read(fasta_path, "fasta")
     seq_len = alignment.get_alignment_length()
@@ -33,12 +68,18 @@ def generate_bootstrap_replicates(fasta_path: str, out_dir: str, b_replicates: i
         rep_paths.append(str(rep_file))
     return rep_paths
 
-def to_skbio_distance_matrix(dist_matrix, taxa_labels: list[str] | None = None) -> DistanceMatrix:
+
+# ==============================================================================
+# SECTION 2: PHYLOFORMER DISTANCE MATRIX VALIDATION & BIONJ CONVERSION
+# ==============================================================================
+
+def to_skbio_distance_matrix(
+    dist_matrix,
+    taxa_labels: list[str] | None = None,
+) -> DistanceMatrix:
     """
     Wraps a Phyloformer NxN distance matrix in a validated scikit-bio DistanceMatrix
-    (Aton et al., 2025). scikit-bio enforces symmetry, a zero diagonal and unique taxon IDs,
-    raising DistanceMatrixError otherwise. Float round-off asymmetry (np.allclose) is
-    symmetrized first; genuine asymmetry is still rejected.
+    (Aton et al., 2025), enforcing symmetry, a zero diagonal, and unique taxon IDs.
     """
     if isinstance(dist_matrix, DistanceMatrix):
         return dist_matrix
@@ -57,16 +98,13 @@ def distance_matrix_to_bionj_newick(
     """
     Converts a Phyloformer NxN pairwise distance matrix into a clamped BIONJ Newick string
     using Gascuel (1997) variance-minimizing agglomerative updates.
-
-    Implemented in NumPy over scikit-bio DistanceMatrix objects (Aton et al., 2025) and
-    validated against the reference FastME BIONJ implementation (Lefort et al., 2015);
-    see tests/test_bionj.py.
+    Validated against reference FastME BIONJ (Lefort et al., 2015); see tests/test_bionj.py.
     """
     dm = to_skbio_distance_matrix(dist_matrix, taxa_labels)
     if dm.shape[0] < 3:
         raise ValueError("BIONJ requires at least 3 taxa.")
     D = np.array(dm.data, dtype=float, copy=True)
-    V = np.array(dm.data, dtype=float, copy=True)  # Initial variances proportional to distance
+    V = np.array(dm.data, dtype=float, copy=True)
     active_nodes = list(dm.ids)
 
     while len(active_nodes) > 3:
@@ -77,7 +115,6 @@ def distance_matrix_to_bionj_newick(
         Q = (r - 2) * D - row_sums[:, None] - row_sums[None, :]
         np.fill_diagonal(Q, np.inf)
 
-        # Find pair (i, j) minimizing Q_{ij}
         i, j = np.unravel_index(np.argmin(Q), Q.shape)
         if i > j:
             i, j = j, i
@@ -86,14 +123,11 @@ def distance_matrix_to_bionj_newick(
         v_ij = V[i, j]
         delta_ij = (row_sums[i] - row_sums[j]) / (r - 2)
 
-        # Raw BIONJ branch-length estimates (used unmodified in the Gascuel recurrences)
         l_i_raw = 0.5 * (d_ij + delta_ij)
         l_j_raw = 0.5 * (d_ij - delta_ij)
-        # Output branch lengths: negative estimates clamped to epsilon (1e-6)
         l_i = max(l_i_raw, epsilon)
         l_j = max(l_j_raw, epsilon)
 
-        # Gascuel (1997) variance-minimizing lambda weight
         if v_ij == 0.0:
             lam = 0.5
         else:
@@ -103,9 +137,6 @@ def distance_matrix_to_bionj_newick(
 
         new_node_str = f"({active_nodes[i]}:{l_i:.6f},{active_nodes[j]}:{l_j:.6f})"
 
-        # Update distances and variances for the new composite node u (Gascuel, 1997):
-        #   d_uk = lam*(d_ik - l_i) + (1-lam)*(d_jk - l_j)
-        #   v_uk = lam*v_ik + (1-lam)*v_jk - lam*(1-lam)*v_ij
         remaining = [k for k in range(r) if k != i and k != j]
         new_d = [
             lam * (D[i, k] - l_i_raw) + (1.0 - lam) * (D[j, k] - l_j_raw)
@@ -116,7 +147,6 @@ def distance_matrix_to_bionj_newick(
             for k in remaining
         ]
 
-        # Rebuild shrunk D, V, and active_nodes
         D_rem = D[np.ix_(remaining, remaining)]
         V_rem = V[np.ix_(remaining, remaining)]
         m = len(remaining)
@@ -129,7 +159,6 @@ def distance_matrix_to_bionj_newick(
 
         active_nodes = [active_nodes[k] for k in remaining] + [new_node_str]
 
-    # Final 3-taxon star resolution
     d01, d02, d12 = D[0, 1], D[0, 2], D[1, 2]
     l0 = max(0.5 * (d01 + d02 - d12), epsilon)
     l1 = max(0.5 * (d01 + d12 - d02), epsilon)
@@ -139,28 +168,36 @@ def distance_matrix_to_bionj_newick(
     ete_tree = Tree(nwk_str, format=1)
     return ete_tree.write(format=1)
 
+
+# ==============================================================================
+# SECTION 3: TREE & SUPPORT NORMALIZER (RULES 1, 2 & 3)
+# ==============================================================================
+
 def standardize_and_root_tree(
     primary_newick_str: str,
     bootstrap_newick_strs: list[str],
     outgroup_taxon: str,
     target_model: str,
-    output_prefix: str
+    output_prefix: str,
 ) -> dict:
     """
-    Maps B=100 bootstrap split frequencies via DendroPy, enforces unit lengths for Fusang,
-    roots at outgroup_taxon via ETE 3, and assigns deterministic post-order labels (N1..Nk).
+    Enforces the 3-Rule Standardization Protocol (Manuscript Section 4.1.1 Item 4):
+      - Rule 1: Universal Outgroup Rooting at outgroup_taxon via ETE 3.
+      - Rule 2: Post-order internal node indexing (N1, N2, ..., Nk) & sorted leaf-set bipartitions.
+      - Rule 3: Empirical bootstrap split-frequency mapping [0%, 100%] via DendroPy, plus
+                placeholder unit branch lengths (1.0) with branch_lengths_present=False for Fusang.
     """
     Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
     taxa = dendropy.TaxonNamespace()
-    primary_dp = dendropy.Tree.get(data=primary_newick_str, schema="newick", taxon_namespace=taxa)
+    primary_dp = dendropy.Tree.get(
+        data=primary_newick_str, schema="newick", taxon_namespace=taxa
+    )
     boot_trees = dendropy.TreeList(taxon_namespace=taxa)
     for b_str in bootstrap_newick_strs:
-        boot_trees.append(dendropy.Tree.get(data=b_str, schema="newick", taxon_namespace=taxa))
+        boot_trees.append(
+            dendropy.Tree.get(data=b_str, schema="newick", taxon_namespace=taxa)
+        )
 
-    # Map empirical bipartition support [0%, 100%] onto primary topology
-    # DendroPy 4: build a SplitDistribution from the bootstrap trees, then write each
-    # internal node's split frequency (fraction 0-1) into its label explicitly.
-    # ETE 3 (format=0) reads these internal labels back as node.support below.
     split_dist = boot_trees.split_distribution(is_bipartitions_updated=False)
     split_freqs = split_dist.split_frequencies
     primary_dp.encode_bipartitions()
@@ -171,12 +208,11 @@ def standardize_and_root_tree(
         bitmask = dp_node.edge.bipartition.split_bitmask
         dp_node.label = f"{split_freqs.get(bitmask, 0.0):.4f}"
 
-    # suppress_rooting=True drops the "[&U]"/"[&R]" token that ETE 3 cannot parse
     dp_newick = primary_dp.as_string(schema="newick", suppress_rooting=True).strip()
     ete_tree = Tree(dp_newick, format=0)
     ete_tree.set_outgroup(ete_tree & outgroup_taxon)
 
-    branch_lengths_present = (target_model != "Fusang")
+    branch_lengths_present = target_model != "Fusang"
     node_index_map = {}
     k_counter = 1
 
@@ -197,7 +233,7 @@ def standardize_and_root_tree(
                 "node_id": node_id,
                 "support_pct": sup_pct,
                 "branch_length": round(float(node.dist), 6),
-                "clade_taxa": clade_leaves
+                "clade_taxa": clade_leaves,
             }
             k_counter += 1
 
@@ -210,7 +246,7 @@ def standardize_and_root_tree(
         "branch_lengths_present": branch_lengths_present,
         "outgroup_taxon": outgroup_taxon,
         "total_internal_nodes": k_counter - 1,
-        "nodes": node_index_map
+        "nodes": node_index_map,
     }
     with open(out_meta, "w") as f:
         json.dump(metadata, f, indent=2)

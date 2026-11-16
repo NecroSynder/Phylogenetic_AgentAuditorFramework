@@ -1,6 +1,32 @@
 """
-Multi-Dimensional Evaluation Metrics for Phase 1 Neuro-Symbolic Auditing
-(Manuscript Section 4.3.2, Equations 4.1 - 4.15, and Statistical Validation Section 4.3.1).
+================================================================================
+PIPELINE STEP 4: MULTI-DIMENSIONAL EVALUATION & STATISTICAL VALIDATION
+(Manuscript Section 4.3.1 & Section 4.3.2, Equations 4.1 – 4.15, Pages 19–27)
+================================================================================
+Implements all mathematical equations and statistical significance tests:
+
+  Part A — Target Phylogenetic Model Metrics (Section 4.3.2.A):
+    - Eq. 4.1: Normalized Robinson-Foulds Distance (RF_norm) [in bio_tools.py]
+    - Eq. 4.2 & 4.3: Global & Conditional False-Confidence Index (FCI) [in bio_tools.py]
+    - Eq. 4.4: Agent-Audited Error Detection Rate (EDR)
+
+  Part B — Biological Accuracy, Faithfulness & Hallucination Metrics (Section 4.3.2.B):
+    - Eq. 4.5 & 4.6: Feature Identification Precision(b), Recall(b), and F1(b)
+    - Eq. 4.7: Bootstrap and Node Support Fidelity (BSF)
+    - Eq. 4.8: Claim-to-Coordinate Verification Rate (CCVR) [in bio_tools.py]
+    - Eq. 4.9: Faithfulness / Context Grounding Score (FGS)
+    - Eq. 4.10: Logical Consistency Rate (LCR)
+
+  Part C — Bayesian Network Transition Information Gain & Unified Goodness (Section 4.3.2.C):
+    - Eq. 4.11: CTMC Branch Transition Probability P = exp(Q * l_k) (4-state DNA & 20-state AA)
+    - Eq. 4.12: Normalized Transition Information Gain IG(b_k) & Shannon Entropy Reduction
+    - Eq. 4.13 & 4.14: 5D Explanation Quality Vector q(b_k) & Per-Node Goodness Score G_node(b_k)
+    - Eq. 4.15: Reconciled Tree-Level Explanation Goodness Score G_tree(T_pred)
+
+  Part D — Non-Parametric Statistical Significance Testing (Section 4.3.1):
+    - Paired Two-Sided Wilcoxon Signed-Rank Test (for continuous metrics)
+    - McNemar's Contingency Test (for binary verification proportions)
+    - Benjamini-Hochberg False Discovery Rate (FDR) correction at alpha = 0.05
 """
 import re
 import numpy as np
@@ -12,6 +38,16 @@ from scipy.stats import wilcoxon
 from statsmodels.stats.contingency_tables import mcnemar
 from statsmodels.stats.multitest import multipletests
 
+DNA_STATES = {"A": 0, "C": 1, "G": 2, "T": 3}
+AA_STATES = {
+    aa: idx
+    for idx, aa in enumerate("ARNDCQEGHILKMFPSTWYV")
+}
+
+
+# ==============================================================================
+# PART A & B: FEATURE F1, BOOTSTRAP SUPPORT FIDELITY (BSF), FAITHFULNESS (FGS)
+# ==============================================================================
 
 def confidence_tier_label(support_pct: float) -> str:
     """
@@ -55,9 +91,24 @@ def compute_bsf_local(support_pct: float, explanation_text: str) -> int:
     expected_tier = confidence_tier_label(support_pct)
     text_lower = explanation_text.lower()
 
-    has_high = any(w in text_lower for w in ("definitive", "high confidence", "high support", "strong support", "high-confidence"))
-    has_moderate = any(w in text_lower for w in ("moderate confidence", "moderate support", "moderate"))
-    has_low = any(w in text_lower for w in ("low confidence", "low support", "weak support", "low-support"))
+    has_high = any(
+        w in text_lower
+        for w in (
+            "definitive",
+            "high confidence",
+            "high support",
+            "strong support",
+            "high-confidence",
+        )
+    )
+    has_moderate = any(
+        w in text_lower
+        for w in ("moderate confidence", "moderate support", "moderate")
+    )
+    has_low = any(
+        w in text_lower
+        for w in ("low confidence", "low support", "weak support", "low-support")
+    )
 
     if expected_tier == "Definitive/High":
         return 1 if (has_high and not has_low) else 0
@@ -83,7 +134,6 @@ def compute_fgs_local(
     if not explanation_text or not explanation_text.strip():
         return 0.0
 
-    # Split explanation into atomic clauses/sentences without breaking decimal numbers (e.g., 100.0%, CI = 1.0)
     clauses = [
         c.strip()
         for c in re.split(r";\s*|\.\s+(?=[A-Z]|$)", explanation_text.strip().rstrip("."))
@@ -93,34 +143,37 @@ def compute_fgs_local(
         return 0.0
 
     valid_sites = {int(m["site"]) for m in synapomorphies}
-    valid_Pairs = {(int(m["site"]), str(m["parent_state"]), str(m["child_state"])) for m in synapomorphies}
+    valid_pairs = {
+        (int(m["site"]), str(m["parent_state"]), str(m["child_state"]))
+        for m in synapomorphies
+    }
     valid_artifact = stressor_diag["primary_artifact"] if stressor_diag else "NONE"
 
     entailed_count = 0
     for clause in clauses:
         clause_ok = True
-        # Check any explicit site numbers cited via "site <int>" or "<State><int><State>"
-        cited_sites_in_clause = [int(x) for x in re.findall(r"\bsite\s+(\d+)\b", clause, flags=re.IGNORECASE)]
+        cited_sites_in_clause = [
+            int(x) for x in re.findall(r"\bsite\s+(\d+)\b", clause, flags=re.IGNORECASE)
+        ]
         for s_num in cited_sites_in_clause:
             if s_num not in valid_sites:
                 clause_ok = False
                 break
 
-        # Check compact mutation tokens like G4C or C128A
-        mut_tokens = re.findall(r"\b([ACGT])-?(\d+)-?>?([ACGT])\b", clause)
+        mut_tokens = re.findall(r"\b([A-Z])-?(\d+)-?>?([A-Z])\b", clause)
         for s_u, s_pos, s_v in mut_tokens:
-            if (int(s_pos), s_u, s_v) not in valid_Pairs:
+            if (int(s_pos), s_u, s_v) not in valid_pairs:
                 clause_ok = False
                 break
 
-        # Check support percentage if cited
-        pct_tokens = re.findall(r"(\d+(?:\.\d+)?)%\s*(?:resampled\s+)?support", clause, flags=re.IGNORECASE)
+        pct_tokens = re.findall(
+            r"(\d+(?:\.\d+)?)%\s*(?:resampled\s+)?support", clause, flags=re.IGNORECASE
+        )
         for pct_str in pct_tokens:
             if abs(float(pct_str) - support_pct) > 1.0:
                 clause_ok = False
                 break
 
-        # Ensure no contradicted artifact label is claimed when valid_artifact is NONE
         if valid_artifact == "NONE" and "artifact of lba" in clause.lower():
             clause_ok = False
 
@@ -129,6 +182,10 @@ def compute_fgs_local(
 
     return round(entailed_count / len(clauses), 4)
 
+
+# ==============================================================================
+# PART C: BAYESIAN TRANSITION INFO GAIN (IG) & UNIFIED EXPLANATION GOODNESS
+# ==============================================================================
 
 def compute_bayesian_transition_metrics(
     cited_mutations: list[dict],
@@ -140,24 +197,36 @@ def compute_bayesian_transition_metrics(
     """
     Computes Bayesian Network Transition Probability log-likelihood (Eq. 4.11),
     clade Shannon entropy reduction in bits, and Normalized Information Gain IG(b_k) (Eq. 4.12).
+    Supports both 4-state nucleotide (DNA) and 20-state amino acid (AA) CTMC rate matrices Q.
     """
-    # 1. Continuous-Time Markov Chain (JC69 / symmetric rate matrix Q) transition matrix P = exp(Q * l_k)
     eff_len = max(float(branch_length), 1e-4)
-    rate_off = 1.0 / 3.0
-    Q = np.full((4, 4), rate_off)
+
+    # Detect whether mutations use 4-state DNA or 20-state Amino Acid alphabet
+    is_protein = any(
+        str(m.get("parent_state", "A")) not in DNA_STATES
+        and str(m.get("parent_state", "A")) in AA_STATES
+        for m in true_branch_mutations
+    )
+    if is_protein:
+        state_map = AA_STATES
+        n_states = 20
+    else:
+        state_map = DNA_STATES
+        n_states = 4
+
+    rate_off = 1.0 / (n_states - 1.0)
+    Q = np.full((n_states, n_states), rate_off)
     np.fill_diagonal(Q, -1.0)
     P_mat = expm(Q * eff_len)
-    state_idx = {"A": 0, "C": 1, "G": 2, "T": 3}
 
     loglik_sum = 0.0
     for m in true_branch_mutations:
         u_s = str(m.get("parent_state", "A"))
         v_s = str(m.get("child_state", "C"))
-        if u_s in state_idx and v_s in state_idx:
-            prob = max(float(P_mat[state_idx[u_s], state_idx[v_s]]), 1e-12)
+        if u_s in state_map and v_s in state_map:
+            prob = max(float(P_mat[state_map[u_s], state_map[v_s]]), 1e-12)
             loglik_sum += float(np.log(prob))
         else:
-            # Indel transition log-likelihood approximation
             loglik_sum += float(np.log(max(eff_len / (1.0 + eff_len), 1e-6)))
 
     if not true_branch_mutations:
@@ -181,14 +250,18 @@ def compute_bayesian_transition_metrics(
         if 0 <= col_idx < alignment.get_alignment_length():
             all_chars = [rec.seq[col_idx] for rec in alignment]
             in_chars = [rec.seq[col_idx] for rec in alignment if rec.id in clade_set]
-            out_chars = [rec.seq[col_idx] for rec in alignment if rec.id not in clade_set]
+            out_chars = [
+                rec.seq[col_idx] for rec in alignment if rec.id not in clade_set
+            ]
             h_total = _col_entropy(all_chars)
             h_cond = (len(in_chars) / n_total) * _col_entropy(in_chars) + (
                 len(out_chars) / n_total
             ) * _col_entropy(out_chars)
             entropy_reductions.append(max(h_total - h_cond, 0.0))
 
-    entropy_red_bits = round(float(np.sum(entropy_reductions)), 4) if entropy_reductions else 0.0
+    entropy_red_bits = (
+        round(float(np.sum(entropy_reductions)), 4) if entropy_reductions else 0.0
+    )
 
     # 3. Normalized Information Gain IG(b_k) (Eq. 4.12)
     true_sls_by_site = {
@@ -228,7 +301,9 @@ def compute_node_goodness(
       G_node(b_k) = CCVR(b_k) * BSF(b_k) * (alpha_1 * F1(b_k) + alpha_2 * IG(b_k) + alpha_3 * FGS(b_k))
     """
     a1, a2, a3 = alphas
-    weighted_sum = (a1 * feature_f1) + (a2 * information_gain_ig) + (a3 * faithfulness_fgs)
+    weighted_sum = (
+        (a1 * feature_f1) + (a2 * information_gain_ig) + (a3 * faithfulness_fgs)
+    )
     score = float(ccvr_local) * float(bsf_local) * weighted_sum
     return round(float(np.clip(score, 0.0, 1.0)), 4)
 
@@ -244,7 +319,7 @@ def compute_lcr(node_audits: list[dict], pred_newick_path: str) -> float:
 
     t_pred = Tree(pred_newick_path, format=1)
     true_tree_clades = {
-         n.name: set(n.get_leaf_names())
+        n.name: set(n.get_leaf_names())
         for n in t_pred.traverse("postorder")
         if not n.is_leaf() and not n.is_root()
     }
@@ -258,20 +333,16 @@ def compute_lcr(node_audits: list[dict], pred_newick_path: str) -> float:
         sup = float(rec["model_support_pct"])
         status = rec["topological_status"]
 
-        # Predicate 1: MonophyleticClade(nid, claimed_clade) matches actual tree split
         total_predicates += 1
         if nid in true_tree_clades and claimed_clade != true_tree_clades[nid]:
             contradictions += 1
 
-        # Predicate 2: Topological status vs support threshold consistency
         total_predicates += 1
         if status == "FALSE_CONFIDENCE_ERROR" and sup < 85.0:
             contradictions += 1
         elif status == "DISCORDANT_LOW_SUPPORT" and sup >= 85.0:
             contradictions += 1
 
-    # Pairwise Laminar Tree Hierarchy Predicate check: any two clades on a rooted tree
-    # must be either disjoint or one a subset of the other (never partially overlapping)
     n_records = len(node_audits)
     for i in range(n_records):
         for j in range(i + 1, n_records):
@@ -333,6 +404,10 @@ def compute_edr(flagged_anomalies: set[str], true_anomalies: set[str]) -> float:
     return round(len(flagged_anomalies & true_anomalies) / len(true_anomalies), 4)
 
 
+# ==============================================================================
+# PART D: PAIRED STATISTICAL SIGNIFICANCE TESTING (SECTION 4.3.1)
+# ==============================================================================
+
 def run_statistical_validation(
     agent_continuous: list[float],
     baseline_continuous: list[float],
@@ -343,16 +418,22 @@ def run_statistical_validation(
     """
     Executes paired two-sided Wilcoxon signed-rank test (for continuous metrics: RF_norm, FCI, F1, FGS)
     and McNemar's test (for binary verification proportions: CCVR, BSF) with Benjamini-Hochberg
-    FDR correction at alpha = 0.05 (Section 4.3.1, page 26).
+    FDR correction at alpha = 0.05 (Section 4.3.1, Page 22 / PDF Page 26).
     """
-    diffs = np.asarray(agent_continuous, dtype=float) - np.asarray(baseline_continuous, dtype=float)
+    diffs = np.asarray(agent_continuous, dtype=float) - np.asarray(
+        baseline_continuous, dtype=float
+    )
     if np.allclose(diffs, 0.0):
         w_stat, w_pval = 0.0, 1.0
     else:
-        res_w = wilcoxon(agent_continuous, baseline_continuous, zero_method="zsplit", alternative="two-sided")
+        res_w = wilcoxon(
+            agent_continuous,
+            baseline_continuous,
+            zero_method="zsplit",
+            alternative="two-sided",
+        )
         w_stat, w_pval = float(res_w.statistic), float(res_w.pvalue)
 
-    # Build 2x2 contingency table for McNemar's test
     a_bin = np.asarray(agent_binary, dtype=int)
     b_bin = np.asarray(baseline_binary, dtype=int)
     n11 = int(np.sum((a_bin == 1) & (b_bin == 1)))
@@ -367,7 +448,9 @@ def run_statistical_validation(
         res_m = mcnemar(table, exact=(n10 + n01 < 25))
         m_stat, m_pval = float(res_m.statistic), float(res_m.pvalue)
 
-    reject, pvals_corrected, _, _ = multipletests([w_pval, m_pval], alpha=alpha, method="fdr_bh")
+    reject, pvals_corrected, _, _ = multipletests(
+        [w_pval, m_pval], alpha=alpha, method="fdr_bh"
+    )
     return {
         "wilcoxon_statistic": round(w_stat, 4),
         "wilcoxon_p_raw": round(w_pval, 6),

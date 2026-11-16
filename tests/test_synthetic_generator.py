@@ -90,3 +90,33 @@ def test_tier2_short_branch_and_recombination_generation(tmp_path: Path) -> None
     with open(gt_dir / "A_true.json") as f:
         a_true = json.load(f)
     assert a_true["recombination_breakpoints"] == [[bp_start, bp_end]]
+
+
+def test_protein_aa_ground_truth_and_20state_ctmc(tmp_path: Path) -> None:
+    """Verify Amino Acid (LG+G4) AliSim simulation and 20-state ASR ground-truth pipeline (Table 4.5)."""
+    raw_dir = tmp_path / "raw_aa"
+    gt_dir = tmp_path / "gt_aa"
+
+    meta = generate_single_synthetic_dataset(
+        dataset_id="TEST_T1_AA_N8_L120_G5_K2",
+        tier=1,
+        n_taxa=8,
+        seq_len=120,
+        out_raw_dir=str(raw_dir),
+        seq_type="AA",
+        gap_proportion=0.05,
+        lba_multiplier=2.0,
+        seed=55,
+        compute_ground_truth=True,
+        out_gt_dir=str(gt_dir),
+    )
+
+    assert (raw_dir / "alignment.fa").exists()
+    assert (gt_dir / "T_true_rooted.nwk").exists()
+    assert (gt_dir / "M_true.tsv").exists()
+    assert (gt_dir / "A_true.json").exists()
+
+    with open(gt_dir / "A_true.json") as f:
+        a_true = json.load(f)
+    assert a_true["sequence_alphabet"] == "AA"
+    assert meta["sequence_type"] == "AA"

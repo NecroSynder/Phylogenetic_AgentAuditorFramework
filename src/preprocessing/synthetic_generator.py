@@ -400,7 +400,7 @@ def generate_single_synthetic_dataset(
     with open(meta_path, "w") as f:
         json.dump(sim_meta, f, indent=2)
 
-    if compute_ground_truth and seq_type.upper() == "DNA":
+    if compute_ground_truth:
         gt_dir = out_gt_dir or str(Path("data/02_ground_truths") / f"tier{tier}" / dataset_id)
         run_ground_truth_pipeline(
             fasta_path=str(fasta_path),
