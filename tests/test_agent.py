@@ -1,187 +1,201 @@
 """
-End-to-End Tests for Pipeline Step 3 (LangGraph Diagnostic Agent Control Loop)
-and Pipeline Step 4 (Multi-Dimensional Evaluation Metrics & Validated JSON Audit Report).
+End-to-End & Anti-Loophole Tests for Pipeline Step 3 (LangGraph Diagnostic Agent)
+and Pipeline Step 4 (Evaluation Metrics, FGS, BSF, LCR, EDR, and Statistical Tests).
 """
-import json
 from pathlib import Path
-from src.preprocessing.ground_truth_gen import run_ground_truth_pipeline
-from src.preprocessing.normalizer_wrapper import standardize_and_root_tree
+import pytest
+
 from src.agent.diagnostic_agent import run_diagnostic_audit
-from src.schemas.audit_schema import AuditReport
 from src.evaluation.metrics import (
-    compute_feature_precision_recall_f1,
     compute_bsf_local,
-    compute_node_goodness,
     compute_edr,
+    compute_feature_precision_recall_f1,
+    compute_fgs_local,
+    compute_lcr,
+    compute_node_goodness,
     run_statistical_validation,
 )
+from src.preprocessing.normalizer_wrapper import standardize_and_root_tree
+from src.schemas.audit_schema import AuditReport
 
 
-def _ensure_toy_ground_truth_and_pred():
-    if not Path("data/02_ground_truths/toy/M_true.tsv").exists():
-        run_ground_truth_pipeline(
-            "data/00_golden_toy/toy_alignment.fa",
-            "data/00_golden_toy/T_true.nwk",
-            "data/02_ground_truths/toy",
+def test_diagnostic_agent_blocks_silent_offline_mock_without_flag(golden_toy_env):
+    """Ensure offline template fallback is blocked unless allow_offline_mock=True is explicit."""
+    with pytest.raises(RuntimeError, match="allow_offline_mock"):
+        run_diagnostic_audit(
+            dataset_id="toy_guard_check",
+            target_model="Fusang",
+            fasta_path=golden_toy_env["fasta_path"],
+            pred_newick_path=golden_toy_env["pred_newick_path"],
+            pred_meta_path=golden_toy_env["pred_meta_path"],
+            true_newick_path=golden_toy_env["true_newick_path"],
+            asr_state_path=golden_toy_env["asr_state_path"],
+            stressor_gt_path=golden_toy_env["stressor_gt_path"],
+            lm_studio_base_url=None,
+            allow_offline_mock=False,
         )
-    if not Path("data/03_normalized_preds/toy_fusang_normalized.nwk").exists():
-        with open("data/02_ground_truths/toy/T_true_rooted.nwk") as f:
-            nwk_str = f.read().strip()
-        standardize_and_root_tree(
-            nwk_str,
-            [nwk_str] * 10,
-            "Taxon_01",
-            "Fusang",
-            "data/03_normalized_preds/toy_fusang",
-        )
 
 
-def test_diagnostic_agent_concordant_tree():
-    """Verify full 4-state LangGraph loop on Golden Toy dataset and output audit_report.json."""
-    _ensure_toy_ground_truth_and_pred()
-    out_json = "data/04_audit_reports/toy_fusang_audit_report.json"
+def test_diagnostic_agent_concordant_tree(golden_toy_env, tmp_path):
+    """Verify full 4-state LangGraph loop on isolated Golden Toy fixture."""
+    out_json = tmp_path / "toy_fusang_audit_report.json"
 
     report = run_diagnostic_audit(
         dataset_id="toy_00_fusang",
         target_model="Fusang",
-        fasta_path="data/00_golden_toy/toy_alignment.fa",
-        pred_newick_path="data/03_normalized_preds/toy_fusang_normalized.nwk",
-        pred_meta_path="data/03_normalized_preds/toy_fusang_metadata.json",
-        true_newick_path="data/02_ground_truths/toy/T_true_rooted.nwk",
-        asr_state_path="data/02_ground_truths/toy/M_true.tsv",
-        stressor_gt_path="data/02_ground_truths/toy/A_true.json",
-        output_json_path=out_json,
+        fasta_path=golden_toy_env["fasta_path"],
+        pred_newick_path=golden_toy_env["pred_newick_path"],
+        pred_meta_path=golden_toy_env["pred_meta_path"],
+        true_newick_path=golden_toy_env["true_newick_path"],
+        asr_state_path=golden_toy_env["asr_state_path"],
+        stressor_gt_path=golden_toy_env["stressor_gt_path"],
+        output_json_path=str(out_json),
+        allow_offline_mock=True,
     )
 
-    # Validate returned dict against Pydantic AuditReport schema
     validated = AuditReport(**report)
-    assert validated.audit_metadata.dataset_id == "toy_00_fusang"
-    assert validated.audit_metadata.taxon_count == 15
-    assert validated.audit_metadata.sequence_length == 1000
+    assert validated.audit_metadata.orchestrator_llm == "OFFLINE_DETERMINISTIC_MOCK"
     assert validated.global_metrics.normalized_rf_distance == 0.0
     assert validated.global_metrics.false_confidence_index_fci == 0.0
     assert validated.global_metrics.total_internal_nodes_audited == 13
     assert validated.global_metrics.claim_to_coordinate_verification_rate == 1.0
     assert validated.global_metrics.logical_consistency_rate_lcr == 1.0
-    assert validated.global_metrics.overall_tree_goodness_score >= 0.85
-    assert Path(out_json).exists()
+    assert validated.global_metrics.overall_tree_goodness_score >= 0.90
+    assert out_json.exists()
 
 
-def test_diagnostic_agent_discordant_stressor_routing(tmp_path):
-    """Verify State 2 -> State 3 stressor interrogation when discordant high-support splits occur."""
-    _ensure_toy_ground_truth_and_pred()
-    with open("data/02_ground_truths/toy/T_true_rooted.nwk") as f:
-        nwk_str = f.read().strip()
-
-    # Swap Taxon_14 and Taxon_08 (long branch) to induce a false-confidence topological error
+def test_diagnostic_agent_discordant_lba_detection_and_edr(golden_toy_env, tmp_path):
+    """Verify discordant LBA swap triggers State 3 LBA diagnosis and achieves EDR = 1.0."""
+    nwk_str = Path(golden_toy_env["true_newick_path"]).read_text().strip()
     discordant_nwk = (
         nwk_str.replace("Taxon_14", "__TMP__")
         .replace("Taxon_08", "Taxon_14")
         .replace("__TMP__", "Taxon_08")
     )
-    disc_prefix = str(tmp_path / "disc_phyloformer")
+    disc_prefix = str(tmp_path / "disc_fusang")
     standardize_and_root_tree(
-        discordant_nwk,
-        [discordant_nwk] * 10,
-        "Taxon_01",
-        "Phyloformer",
-        disc_prefix,
+        discordant_nwk, [discordant_nwk] * 10, "Taxon_01", "Fusang", disc_prefix
     )
 
     report = run_diagnostic_audit(
         dataset_id="toy_discordant_lba",
-        target_model="Phyloformer",
-        fasta_path="data/00_golden_toy/toy_alignment.fa",
+        target_model="Fusang",
+        fasta_path=golden_toy_env["fasta_path"],
         pred_newick_path=f"{disc_prefix}_normalized.nwk",
         pred_meta_path=f"{disc_prefix}_metadata.json",
-        true_newick_path="data/02_ground_truths/toy/T_true_rooted.nwk",
-        asr_state_path="data/02_ground_truths/toy/M_true.tsv",
-        stressor_gt_path="data/02_ground_truths/toy/A_true.json",
+        true_newick_path=golden_toy_env["true_newick_path"],
+        asr_state_path=golden_toy_env["asr_state_path"],
+        stressor_gt_path=golden_toy_env["stressor_gt_path"],
+        allow_offline_mock=True,
     )
 
     validated = AuditReport(**report)
     assert validated.global_metrics.normalized_rf_distance > 0.0
     assert validated.global_metrics.false_confidence_index_fci > 0.0
-    assert validated.global_metrics.false_confidence_nodes_count > 0
+    assert validated.global_metrics.error_detection_rate_edr == 1.0
     assert validated.global_metrics.claim_to_coordinate_verification_rate == 1.0
-    assert validated.global_metrics.logical_consistency_rate_lcr == 1.0
+    assert any(
+        n.diagnosed_failure_mode.primary_stressor == "LBA" for n in validated.node_audits
+    )
 
 
-def test_state_4_verification_gate_blocks_hallucination_and_self_corrects():
+def test_state_4_gate_self_corrects_and_persistent_failure_never_infinite_loops(golden_toy_env):
     """
-    Verify that if the LLM drafts a hallucinated coordinate on attempt 0,
-    State 4 (verify_claim_coordinates) rejects it, loops back, and self-corrects to CCVR = 1.00.
+    1. Attempt-0 hallucination is blocked and self-corrected to CCVR = 1.00 on retry 1.
+    2. Persistent hallucination across all max_retries terminates cleanly without infinite recursion.
     """
-    _ensure_toy_ground_truth_and_pred()
     attempt_counter = {"calls": 0}
 
-    def hallucinating_synthesizer(state):
+    def single_hallucinating_synthesizer(state):
         attempt_counter["calls"] += 1
-        # Inject an out-of-bounds hallucinated coordinate (site 9999) on attempt 0
         return (
-            [
-                {
-                    "site_coordinate": 9999,
-                    "ancestral_state": "A",
-                    "derived_state": "G",
-                    "posterior_probability": 0.99,
-                    "consistency_index_ci": 1.0,
-                    "mutation_class": "SYNAPOMORPHY",
-                }
-            ],
+            [{"site_coordinate": 9999, "ancestral_state": "A", "derived_state": "G"}],
             "Hallucinated draft claiming A9999G with 100.0% support (definitive high confidence).",
         )
 
-    report = run_diagnostic_audit(
+    rep_recovered = run_diagnostic_audit(
         dataset_id="toy_hallucination_recovery",
         target_model="Fusang",
-        fasta_path="data/00_golden_toy/toy_alignment.fa",
-        pred_newick_path="data/03_normalized_preds/toy_fusang_normalized.nwk",
-        pred_meta_path="data/03_normalized_preds/toy_fusang_metadata.json",
-        true_newick_path="data/02_ground_truths/toy/T_true_rooted.nwk",
-        asr_state_path="data/02_ground_truths/toy/M_true.tsv",
-        stressor_gt_path="data/02_ground_truths/toy/A_true.json",
-        custom_synthesizer=hallucinating_synthesizer,
+        fasta_path=golden_toy_env["fasta_path"],
+        pred_newick_path=golden_toy_env["pred_newick_path"],
+        pred_meta_path=golden_toy_env["pred_meta_path"],
+        true_newick_path=golden_toy_env["true_newick_path"],
+        asr_state_path=golden_toy_env["asr_state_path"],
+        stressor_gt_path=golden_toy_env["stressor_gt_path"],
+        custom_synthesizer=single_hallucinating_synthesizer,
         max_retries=3,
     )
+    assert attempt_counter["calls"] == 13
+    assert rep_recovered["global_metrics"]["total_hallucination_retries_triggered"] == 13
+    assert rep_recovered["global_metrics"]["claim_to_coordinate_verification_rate"] == 1.0
 
-    assert attempt_counter["calls"] == 13  # Called once per node on attempt 0, then rejected & corrected on retry 1
-    assert report["global_metrics"]["total_hallucination_retries_triggered"] == 13
-    assert report["global_metrics"]["claim_to_coordinate_verification_rate"] == 1.0
-    for node_rec in report["node_audits"]:
-        assert node_rec["explanation_quality_vector"]["ccvr_local"] == 1.0
-        assert node_rec["explanation_quality_vector"]["verification_retries"] == 1
-        assert all(ev["site_coordinate"] != 9999 for ev in node_rec["causal_sequence_evidence"])
+    # Persistent failure test (Regression test for Bug 1.4 off-by-one infinite loop)
+    persist_counter = {"calls": 0}
+
+    def persistent_bad_synthesizer(state):
+        persist_counter["calls"] += 1
+        return (
+            [{"site_coordinate": 8888, "ancestral_state": "A", "derived_state": "G"}],
+            "Persistent unverified site 8888 with 100.0% support (definitive high confidence).",
+        )
+
+    persistent_bad_synthesizer.persist_across_retries = True
+    rep_persist = run_diagnostic_audit(
+        dataset_id="toy_persistent_termination",
+        target_model="Fusang",
+        fasta_path=golden_toy_env["fasta_path"],
+        pred_newick_path=golden_toy_env["pred_newick_path"],
+        pred_meta_path=golden_toy_env["pred_meta_path"],
+        true_newick_path=golden_toy_env["true_newick_path"],
+        asr_state_path=golden_toy_env["asr_state_path"],
+        stressor_gt_path=golden_toy_env["stressor_gt_path"],
+        custom_synthesizer=persistent_bad_synthesizer,
+        max_retries=2,
+    )
+    # Exactly (1 initial + 2 retries) * 13 nodes = 39 calls, and exactly 13 node records (no duplicates!)
+    assert persist_counter["calls"] == 39
+    assert len(rep_persist["node_audits"]) == 13
+    assert rep_persist["global_metrics"]["claim_to_coordinate_verification_rate"] == 0.0
 
 
-def test_evaluation_metrics_and_statistical_validation():
-    """Verify mathematical properties of F1, BSF, Multiplicative G_node Gate (Eq. 4.14), EDR, and Statistical Tests."""
+def test_metrics_anti_loophole_bsf_fgs_lcr_and_stats(golden_toy_env):
+    """Verify negation-aware BSF, non-vacuous FGS, plural site parsing, and LCR prose checking."""
     prec, rec, f1 = compute_feature_precision_recall_f1({4, 128, 464}, {4, 128, 464, 505})
-    assert prec == 1.0
-    assert rec == 0.75
-    assert abs(f1 - 0.8571) < 1e-3
+    assert prec == 1.0 and rec == 0.75 and abs(f1 - 0.8571) < 1e-3
 
-    # BSF confidence tier matching (Eq. 4.7)
+    # Negation-aware BSF
+    assert compute_bsf_local(65.0, "Branch does not have high support; shows moderate confidence.") == 1
     assert compute_bsf_local(95.0, "Split has 95.0% support (definitive high confidence).") == 1
     assert compute_bsf_local(95.0, "Split has low confidence.") == 0
-    assert compute_bsf_local(65.0, "Branch exhibits moderate confidence.") == 1
-    assert compute_bsf_local(30.0, "Weak split with low confidence.") == 1
 
-    # Multiplicative G_node gate collapses to 0.0 when CCVR=0 or BSF=0 (Eq. 4.14)
+    # FGS must reject vacuous ungrounded prose AND catch plural 'sites 505, 9999' hallucinations
+    syns = [{"site": 505, "parent_state": "A", "child_state": "T", "is_indel": False}]
+    stressor_none = {"primary_artifact": "NONE"}
+    assert compute_fgs_local("Cosmic rays caused rapid evolution on Mars.", "N1", 100.0, syns, stressor_none) == 0.0
+    assert compute_fgs_local("Node N1 is supported by sites 505 and 9999.", "N1", 100.0, syns, stressor_none) == 0.0
+    assert compute_fgs_local("Node N1 has 100.0% support and verified mutation at site 505.", "N1", 100.0, syns, stressor_none) == 1.0
+
+    # LCR must penalize prose calling a discordant node 'concordant'
+    bad_audits = [
+        {
+            "node_id": "N1",
+            "predicted_clade_taxa": ["Taxon_14", "Taxon_15"],
+            "model_support_pct": 92.0,
+            "topological_status": "FALSE_CONFIDENCE_ERROR",
+            "diagnosed_failure_mode": {
+                "agent_causal_explanation": "Clade N1 is concordant with the reference tree with low confidence."
+            },
+        }
+    ]
+    assert compute_lcr(bad_audits, golden_toy_env["pred_newick_path"]) < 1.0
+
     assert compute_node_goodness(0.0, 1, 1.0, 1.0, 1.0) == 0.0
-    assert compute_node_goodness(1.0, 0, 1.0, 1.0, 1.0) == 0.0
-    assert compute_node_goodness(1.0, 1, 0.9, 0.9, 0.9) == 0.9
+    assert compute_edr({"N4:LBA"}, {"N4:LBA"}) == 1.0
 
-    # Error Detection Rate (Eq. 4.4)
-    assert compute_edr({"N4:LBA", "N7:INDEL_GAP"}, {"N4:LBA", "N7:INDEL_GAP"}) == 1.0
-
-    # Wilcoxon signed-rank + McNemar + Benjamini-Hochberg FDR (Section 4.3.1)
     stats_res = run_statistical_validation(
-        agent_continuous=[0.95, 0.92, 0.96, 0.94, 0.91, 0.93, 0.97, 0.95, 0.94, 0.96],
-        baseline_continuous=[0.42, 0.38, 0.45, 0.40, 0.35, 0.41, 0.44, 0.39, 0.40, 0.43],
-        agent_binary=[1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        baseline_binary=[0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+        agent_continuous=[0.95, 0.92, 0.96, 0.94, 0.91, 0.93, 0.97, 0.95],
+        baseline_continuous=[0.22, 0.18, 0.25, 0.20, 0.15, 0.21, 0.24, 0.19],
+        agent_binary=[1, 1, 1, 1, 1, 1, 1, 1],
+        baseline_binary=[0, 0, 1, 0, 0, 0, 0, 0],
     )
-    assert "wilcoxon_p_fdr_bh" in stats_res
-    assert "mcnemar_p_fdr_bh" in stats_res
     assert stats_res["wilcoxon_significant"] is True

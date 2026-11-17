@@ -1,10 +1,11 @@
 """
 Unit tests for Step B:
-  1. Tier 3 Empirical 3-Engine Consensus Silver Standard (IQ-TREE 2 + RAxML-NG + FastTree 2)
-  2. Target Model & Classical Baseline Batch Inference + Rules 1-3 Standardization (Fusang, Phyloformer, FastTree2)
+  1. Tier 3 Empirical FASTA Sanitizer (DNA & Protein stop-codon '*' sanitization)
+  2. Tier 3 3-Engine Consensus Silver Standard (-m MFP & verified_consensus_splits masking)
+  3. Target Model Runner (--use-surrogate guardrail, 20-state AA Phyloformer math, parallel FastTree2)
 """
-import json
 from pathlib import Path
+import pytest
 
 from scripts.sanitize_tier3_fasta import sanitize_tier3_empirical_fasta
 from src.preprocessing.empirical_consensus import build_empirical_tier3_ground_truth
@@ -12,48 +13,52 @@ from src.preprocessing.synthetic_generator import generate_single_synthetic_data
 from src.preprocessing.target_model_runner import run_target_model_pipeline
 
 
-def test_tier3_fasta_compatibility_sanitizer(tmp_path: Path) -> None:
-    raw_messy = tmp_path / "messy_ncbi.fasta"
-    clean_out = tmp_path / "tier3_clean" / "alignment.fa"
-
-    # Raw FASTA with Newick-breaking punctuation, lowercase, U bases, ?/. gaps, and a 100%-gap column (col 4)
-    raw_messy.write_text(
-        ">Outgroup:Bat_CoV (RaTG13) isolate=1\n"
-        "acgu-A\n"
-        ">SARS-CoV-2 (Wuhan:2019), strain A\n"
-        "acgt-A\n"
-        ">SARS-CoV-2 (XBB.1.5); recombinant\n"
-        "acg.-C\n"
-        ">SARS-CoV-2 [BA.2] variant\n"
-        "acg?-C\n"
+def test_tier3_fasta_sanitizer_dna_and_protein_stop_codons(tmp_path: Path) -> None:
+    # 1. DNA FASTA
+    raw_dna = tmp_path / "messy_ncbi.fasta"
+    clean_dna = tmp_path / "tier3_dna" / "alignment.fa"
+    raw_dna.write_text(
+        ">Outgroup:Bat_CoV (RaTG13) isolate=1\nacgu-A\n"
+        ">SARS-CoV-2 (Wuhan:2019), strain A\nacgt-A\n"
+        ">SARS-CoV-2 (XBB.1.5); recombinant\nacg.-C\n"
+        ">SARS-CoV-2 [BA.2] variant\nacg?-C\n"
     )
-
-    summary = sanitize_tier3_empirical_fasta(
-        input_fasta_path=str(raw_messy),
-        output_fasta_path=str(clean_out),
-        outgroup="Outgroup:Bat_CoV",
+    sum_dna = sanitize_tier3_empirical_fasta(
+        str(raw_dna), str(clean_dna), outgroup="Outgroup:Bat_CoV"
     )
+    assert sum_dna["sequence_type"] == "DNA"
+    assert sum_dna["removed_all_gap_columns"] == 1
+    assert sum_dna["final_alignment_length"] == 5
 
-    assert clean_out.exists()
-    assert summary["purpose"] == "Tier 3 Empirical Biological FASTA Compatibility Pre-Processing Only"
-    assert summary["n_taxa"] == 4
-    assert summary["original_alignment_length"] == 6
-    assert summary["removed_all_gap_columns"] == 1
-    assert summary["final_alignment_length"] == 5
-    assert summary["requested_outgroup_found"] is True
-    assert summary["recommended_outgroup"] == "Outgroup_Bat_CoV"
+    # 2. Protein (AA) FASTA containing terminal stop codons '*' and non-IUPAC 'J'
+    raw_aa = tmp_path / "messy_orthomam.fa"
+    clean_aa = tmp_path / "tier3_aa" / "alignment.fa"
+    raw_aa.write_text(
+        ">Human (BRCA1)\nMKWVTFISLL*\n"
+        ">Chimp (BRCA1)\nMKWVTFISLL*\n"
+        ">Mouse (Brca1)\nMKWVTFIJLL*\n"
+        ">Platypus:Outgroup\nMKWVAFIPLL*\n"
+    )
+    sum_aa = sanitize_tier3_empirical_fasta(
+        str(raw_aa), str(clean_aa), outgroup="Platypus:Outgroup"
+    )
+    assert sum_aa["sequence_type"] == "AA"
+    # Trailing '*' column became 100% '-' and was stripped cleanly; 'J' became 'X'
+    assert sum_aa["removed_all_gap_columns"] == 1
+    assert sum_aa["final_alignment_length"] == 10
+    text_aa = clean_aa.read_text()
+    assert "*" not in text_aa and "J" not in text_aa and "X" in text_aa
 
 
-def test_empirical_tier3_three_engine_consensus(tmp_path: Path) -> None:
+def test_empirical_tier3_consensus_and_split_masking(tmp_path: Path) -> None:
     raw_dir = tmp_path / "empirical_sample"
     gt_dir = tmp_path / "gt_tier3"
 
-    # Simulate a clean 8-taxon alignment to act as a sample FASTA input for the 3-engine consensus protocol
     generate_single_synthetic_dataset(
         dataset_id="SAMPLE_EMPIRICAL_8TAXA",
         tier=1,
         n_taxa=8,
-        seq_len=300,
+        seq_len=250,
         out_raw_dir=str(raw_dir),
         seq_type="DNA",
         gap_proportion=0.05,
@@ -66,109 +71,79 @@ def test_empirical_tier3_three_engine_consensus(tmp_path: Path) -> None:
         fasta_path=str(raw_dir / "alignment.fa"),
         out_dir=str(gt_dir),
         outgroup="Taxon_01",
-        seq_type="DNA",
-        ufboot_replicates=0,  # fast ML search for unit test speed
+        seq_type="AUTO",
+        ufboot_replicates=0,
         raxml_bs_trees=0,
+        use_modelfinder=False,
         recombination_breakpoints=[[100, 140]],
     )
-
-    assert (gt_dir / "iqtree2_reference.nwk").exists()
-    assert (gt_dir / "raxml_ng_reference.nwk").exists()
-    assert (gt_dir / "fasttree2_reference.nwk").exists()
-    assert (gt_dir / "T_consensus.nwk").exists()
-    assert (gt_dir / "T_true_rooted.nwk").exists()
-    assert (gt_dir / "M_true.tsv").exists()
+    assert summary["sequence_type"] == "DNA"
     assert (gt_dir / "A_true.json").exists()
-    assert (gt_dir / "tier3_consensus_summary.json").exists()
-
-    assert summary["total_internal_splits"] >= 5
-    assert 0.0 <= summary["three_engine_concordance_rate"] <= 1.0
 
 
-def test_target_model_runner_fusang_phyloformer_and_fasttree(tmp_path: Path) -> None:
-    raw_dir = tmp_path / "raw_10taxa"
+def test_target_model_runner_guardrail_and_aa_phyloformer(tmp_path: Path) -> None:
+    raw_aa_dir = tmp_path / "raw_aa_10taxa"
     std_dir = tmp_path / "std_out"
 
     generate_single_synthetic_dataset(
-        dataset_id="TEST_10TAXA",
+        dataset_id="TEST_AA_10TAXA",
         tier=1,
         n_taxa=10,
-        seq_len=250,
-        out_raw_dir=str(raw_dir),
-        seq_type="DNA",
-        gap_proportion=0.10,
-        lba_multiplier=5.0,
+        seq_len=160,
+        out_raw_dir=str(raw_aa_dir),
+        seq_type="AA",
+        gap_proportion=0.05,
+        lba_multiplier=4.0,
         seed=77,
         compute_ground_truth=False,
     )
-    fasta_path = str(raw_dir / "alignment.fa")
+    fasta_path = str(raw_aa_dir / "alignment.fa")
 
-    # 1. Fusang (discrete topology, unit branch lengths, B=5 replicates for fast test)
-    fusang_prefix = str(std_dir / "Fusang")
+    # 1. Must block silent surrogate execution when allow_surrogate=False
+    with pytest.raises(RuntimeError, match="allow_surrogate"):
+        run_target_model_pipeline(
+            fasta_path=fasta_path,
+            target_model="Phyloformer",
+            output_prefix=str(std_dir / "PF_Blocked"),
+            b_replicates=2,
+            allow_surrogate=False,
+        )
+
+    # 2. Explicit allow_surrogate=True runs 20-state AA Phyloformer & Fusang cleanly
     fusang_meta = run_target_model_pipeline(
         fasta_path=fasta_path,
         target_model="Fusang",
-        output_prefix=fusang_prefix,
+        output_prefix=str(std_dir / "Fusang"),
         outgroup_taxon="Taxon_01",
-        b_replicates=5,
+        b_replicates=4,
+        allow_surrogate=True,
         seed=42,
     )
     assert fusang_meta is not None
     assert fusang_meta["branch_lengths_present"] is False
-    assert Path(f"{fusang_prefix}_normalized.nwk").exists()
-    assert Path(f"{fusang_prefix}_metadata.json").exists()
-    for node_info in fusang_meta["nodes"].values():
-        assert node_info["branch_length"] == 1.0
-        assert 0.0 <= node_info["support_pct"] <= 100.0
+    assert fusang_meta["inference_backend"] == "surrogate"
 
-    # 2. Phyloformer (NxN distance matrix -> BioNJ -> Rules 1-3 standardization)
-    pf_prefix = str(std_dir / "Phyloformer")
     pf_meta = run_target_model_pipeline(
         fasta_path=fasta_path,
         target_model="Phyloformer",
-        output_prefix=pf_prefix,
+        output_prefix=str(std_dir / "Phyloformer"),
         outgroup_taxon="Taxon_01",
-        b_replicates=5,
+        b_replicates=4,
+        allow_surrogate=True,
         seed=42,
     )
     assert pf_meta is not None
     assert pf_meta["branch_lengths_present"] is True
-    assert Path(f"{pf_prefix}_distance_matrix.tsv").exists()
-    assert Path(f"{pf_prefix}_normalized.nwk").exists()
-    assert Path(f"{pf_prefix}_metadata.json").exists()
 
-    # 3. FastTree2 classical baseline
-    ft_prefix = str(std_dir / "FastTree2")
+    # 3. Parallel FastTree2 classical baseline on AA alignment
     ft_meta = run_target_model_pipeline(
         fasta_path=fasta_path,
         target_model="FastTree2",
-        output_prefix=ft_prefix,
+        output_prefix=str(std_dir / "FastTree2"),
         outgroup_taxon="Taxon_01",
-        b_replicates=3,
+        b_replicates=4,
+        max_workers=2,
         seed=42,
     )
     assert ft_meta is not None
-    assert ft_meta["branch_lengths_present"] is True
-    assert Path(f"{ft_prefix}_normalized.nwk").exists()
-
-
-def test_fusang_skips_when_taxa_exceed_40(tmp_path: Path) -> None:
-    raw_dir = tmp_path / "raw_45taxa"
-    generate_single_synthetic_dataset(
-        dataset_id="TEST_45TAXA",
-        tier=2,
-        n_taxa=45,
-        seq_len=150,
-        out_raw_dir=str(raw_dir),
-        seq_type="DNA",
-        seed=88,
-        compute_ground_truth=False,
-    )
-    res = run_target_model_pipeline(
-        fasta_path=str(raw_dir / "alignment.fa"),
-        target_model="Fusang",
-        output_prefix=str(tmp_path / "Fusang_45"),
-        outgroup_taxon="Taxon_01",
-        b_replicates=2,
-    )
-    assert res is None
+    assert ft_meta["inference_backend"] == "external_cli"

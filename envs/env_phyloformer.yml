@@ -1,0 +1,23 @@
+# Isolated Conda Environment for Phyloformer (Nesterenko et al., 2024; Table 4.2)
+# Upstream repository: https://github.com/lucanest/Phyloformer
+# Uses CUDA 12.8 (cu128) PyTorch wheels for full Blackwell (RTX 50-series sm_120) & Ampere/Ada GPU support.
+# Create with:
+#   conda env create -f envs/env_phyloformer.yml
+name: env_phyloformer
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.9
+  - numpy<2.0
+  - scipy
+  - biopython
+  - dendropy
+  - fastme
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch>=2.7.0
+      - einops
+      - tqdm

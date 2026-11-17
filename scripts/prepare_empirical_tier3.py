@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 CLI Driver for Tier 3 Empirical 3-Engine Consensus Silver Standard Preparation
-(Manuscript Section 4.2.2 & Table 4.1).
+(Manuscript Section 4.1.1.1.2 & Table 4.5).
 
 Processes real biological FASTA files (TreeBASE, OrthoMaM v12, SARS-CoV-2 / HIV-1)
-by running IQ-TREE 2, RAxML-NG, and FastTree 2 to establish the 3-engine consensus
-reference tree and generating T_true_rooted.nwk, M_true.tsv, and A_true.json.
+by auto-detecting DNA vs. Protein alphabet, running IQ-TREE 2 (ModelFinder -m MFP),
+RAxML-NG, and FastTree 2, and generating T_true_rooted.nwk, M_true.tsv, and A_true.json.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import sys
@@ -21,48 +23,27 @@ from src.preprocessing.empirical_consensus import build_empirical_tier3_ground_t
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build Tier 3 Empirical 3-Engine Consensus Silver Standard (IQ-TREE 2 + RAxML-NG + FastTree 2)."
+        description="Build Tier 3 Empirical 3-Engine Consensus Silver Standard (IQ-TREE 2 ModelFinder + RAxML-NG + FastTree 2)."
     )
+    parser.add_argument("--fasta", help="Path to a single empirical biological FASTA file to process.")
+    parser.add_argument("--dataset-id", help="Dataset identifier when --fasta is used.")
+    parser.add_argument("--outgroup", default=None, help="Outgroup taxon name.")
     parser.add_argument(
-        "--fasta",
-        help="Path to a single empirical biological FASTA file to process.",
-    )
-    parser.add_argument(
-        "--dataset-id",
-        help="Dataset identifier when --fasta is used (defaults to FASTA stem).",
-    )
-    parser.add_argument(
-        "--outgroup",
-        default=None,
-        help="Outgroup taxon name (defaults to lexicographically first taxon).",
+        "--seq-type",
+        choices=["AUTO", "DNA", "AA"],
+        default="AUTO",
+        help="Sequence alphabet (defaults to AUTO detection).",
     )
     parser.add_argument(
         "--recomb-breakpoints",
         default=None,
         help="Optional JSON list of known recombinant intervals, e.g. '[[400, 650]]'.",
     )
-    parser.add_argument(
-        "--raw-tier3-dir",
-        default="data/01_raw_alignments/tier3",
-        help="Directory to scan for empirical FASTA files when --fasta is omitted.",
-    )
-    parser.add_argument(
-        "--out-gt-root",
-        default="data/02_ground_truths/tier3",
-        help="Output root directory for Tier 3 ground truths.",
-    )
-    parser.add_argument(
-        "--ufboot",
-        type=int,
-        default=1000,
-        help="Number of UFBoot replicates for IQ-TREE 2 (set 0 for fast ML search without UFBoot).",
-    )
-    parser.add_argument(
-        "--raxml-bs",
-        type=int,
-        default=0,
-        help="Number of RAxML-NG bootstrap trees (0 = ML search + IQ-TREE/FastTree support check).",
-    )
+    parser.add_argument("--raw-tier3-dir", default="data/01_raw_alignments/tier3")
+    parser.add_argument("--out-gt-root", default="data/02_ground_truths/tier3")
+    parser.add_argument("--ufboot", type=int, default=1000)
+    parser.add_argument("--raxml-bs", type=int, default=0)
+    parser.add_argument("--no-modelfinder", action="store_true", help="Disable -m MFP and use fixed GTR+G4 / LG+G4.")
     args = parser.parse_args()
 
     recomb_bps = json.loads(args.recomb_breakpoints) if args.recomb_breakpoints else []
@@ -76,14 +57,16 @@ def main() -> None:
             fasta_path=str(fa_path),
             out_dir=str(out_dir),
             outgroup=args.outgroup,
+            seq_type=args.seq_type,
             recombination_breakpoints=recomb_bps,
             ufboot_replicates=args.ufboot,
             raxml_bs_trees=args.raxml_bs,
+            use_modelfinder=(not args.no_modelfinder),
         )
         print(
-            f"[+] Completed {ds_id}: {summary['three_engine_concordant_splits']}/"
-            f"{summary['total_internal_splits']} splits concordant across all 3 engines "
-            f"({summary['three_engine_concordance_rate']*100:.1f}%)."
+            f"[+] Completed {ds_id} ({summary['sequence_type']}): "
+            f"{summary['three_engine_concordant_splits']}/{summary['total_internal_splits']} splits "
+            f"concordant across all 3 engines ({summary['three_engine_concordance_rate']*100:.1f}%)."
         )
         return
 
@@ -107,13 +90,15 @@ def main() -> None:
             fasta_path=str(fa_path),
             out_dir=str(out_dir),
             outgroup=args.outgroup,
+            seq_type=args.seq_type,
             recombination_breakpoints=recomb_bps,
             ufboot_replicates=args.ufboot,
             raxml_bs_trees=args.raxml_bs,
+            use_modelfinder=(not args.no_modelfinder),
         )
         print(
-            f"[+] Completed {ds_id}: {summary['three_engine_concordant_splits']}/"
-            f"{summary['total_internal_splits']} splits concordant across all 3 engines."
+            f"[+] Completed {ds_id} ({summary['sequence_type']}): "
+            f"{summary['three_engine_concordant_splits']}/{summary['total_internal_splits']} splits concordant."
         )
 
 

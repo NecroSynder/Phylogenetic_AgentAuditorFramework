@@ -2,26 +2,21 @@
 """
 TIER 3 EMPIRICAL FASTA COMPATIBILITY SANITIZER (scripts/sanitize_tier3_fasta.py)
 ================================================================================
-NOTE: This utility is ONLY needed when preparing external, real-world biological
-FASTA files downloaded from public databases (TreeBASE, OrthoMaM v12, NCBI Virus,
-Los Alamos HIV DB) for **Tier 3 (Empirical Biological Benchmarks)**.
-It is NOT needed for Tier 1 or Tier 2 synthetic benchmarks.
-
-What this compatibility script does (without altering biological homology):
-  1. Strips Newick-breaking punctuation (spaces, ':', ';', '(', ')', ',', '[', ']')
-     from raw database FASTA headers and ensures unique taxon IDs.
-  2. Converts RNA 'U' -> 'T', '.' or '?' -> '-' (standard gap character), and
-     lowercased bases -> uppercase.
-  3. Verifies that all sequences have equal aligned column length L.
-  4. Removes columns that are 100% gaps ('-') across all taxa (common when subsetting
-     larger database alignments) and logs a coordinate mapping summary.
-  5. Verifies (or suggests) the designated outgroup taxon name for Tier 3 rooting.
+Sanitizes external real-world biological FASTA alignments (TreeBASE, OrthoMaM v12,
+NCBI Virus, Los Alamos HIV DB) for both Nucleotide ('DNA') and Amino Acid ('AA'):
+  1. Strips Newick-breaking punctuation from FASTA headers and ensures unique taxon IDs.
+  2. Converts '.' / '?' / '*' (stop codons in AA) -> '-', RNA 'U' -> 'T' (in DNA),
+     and sanitizes non-IUPAC symbols cleanly ('N' for DNA, 'X' for Protein).
+  3. Verifies equal aligned column length L and strips 100%-gap columns.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import re
 import sys
 from pathlib import Path
+
 import numpy as np
 from Bio import SeqIO
 from Bio.Align import MultipleSeqAlignment
@@ -30,10 +25,6 @@ from Bio.SeqRecord import SeqRecord
 
 
 def clean_taxon_header(raw_header: str, max_len: int = 48) -> str:
-    """
-    Replaces spaces and Newick-reserved punctuation (:,;()[]'") with underscores
-    so ETE 3, DendroPy, IQ-TREE 2, RAxML-NG, and FastTree 2 parse taxon labels cleanly.
-    """
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_header.strip())
     cleaned = re.sub(r"\.+", "_", cleaned)
     cleaned = re.sub(r"_+", "_", cleaned).strip("_")
@@ -42,17 +33,22 @@ def clean_taxon_header(raw_header: str, max_len: int = 48) -> str:
     return cleaned[:max_len].rstrip("_")
 
 
+def _infer_alphabet_from_records(records: list) -> str:
+    chars = set()
+    for rec in records[: min(10, len(records))]:
+        chars.update(str(rec.seq).upper())
+    chars -= {"-", ".", "?", "*", "N", "X"}
+    dna_chars = {"A", "C", "G", "T", "U", "R", "Y", "S", "W", "K", "M", "B", "D", "H", "V"}
+    return "DNA" if (chars and chars.issubset(dna_chars)) else "AA"
+
+
 def sanitize_tier3_empirical_fasta(
     input_fasta_path: str,
     output_fasta_path: str,
     outgroup: str | None = None,
-    seq_type: str = "DNA",
+    seq_type: str = "AUTO",
     strip_all_gap_cols: bool = True,
 ) -> dict:
-    """
-    Sanitizes an external empirical FASTA file purely for Tier 3 pipeline compatibility.
-    Returns a summary dictionary including old->new taxon ID mapping and alignment stats.
-    """
     raw_records = list(SeqIO.parse(input_fasta_path, "fasta"))
     if len(raw_records) < 4:
         raise ValueError(
@@ -68,14 +64,19 @@ def sanitize_tier3_empirical_fasta(
         )
 
     orig_len = lengths.pop()
-    is_dna = seq_type.upper() == "DNA"
+    resolved_type = (
+        _infer_alphabet_from_records(raw_records)
+        if seq_type.upper() == "AUTO"
+        else seq_type.upper()
+    )
+    is_dna = resolved_type == "DNA"
 
     used_names: set[str] = set()
     header_map: dict[str, str] = {}
     cleaned_ids: list[str] = []
     seq_rows: list[list[str]] = []
 
-    for idx, rec in enumerate(raw_records, start=1):
+    for rec in raw_records:
         full_title = rec.description if rec.description else rec.id
         base_clean = clean_taxon_header(rec.id)
         candidate = base_clean
@@ -88,11 +89,13 @@ def sanitize_tier3_empirical_fasta(
         cleaned_ids.append(candidate)
 
         s = str(rec.seq).upper()
-        s = s.replace(".", "-").replace("?", "-")
+        s = s.replace(".", "-").replace("?", "-").replace("*", "-")
         if is_dna:
             s = s.replace("U", "T")
-            # Any non-standard DNA symbol outside A,C,G,T,- becomes N
             s = re.sub(r"[^ACGTN-]", "N", s)
+        else:
+            # Standard 20 IUPAC amino acids + X ambiguity + '-' gap
+            s = re.sub(r"[^ACDEFGHIKLMNPQRSTVWYX-]", "X", s)
         seq_rows.append(list(s))
 
     char_mat = np.array(seq_rows)
@@ -130,6 +133,7 @@ def sanitize_tier3_empirical_fasta(
 
     summary = {
         "purpose": "Tier 3 Empirical Biological FASTA Compatibility Pre-Processing Only",
+        "sequence_type": resolved_type,
         "input_fasta": str(input_fasta_path),
         "output_fasta": str(output_fasta_path),
         "n_taxa": len(cleaned_ids),
@@ -151,35 +155,13 @@ def sanitize_tier3_empirical_fasta(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "[TIER 3 COMPATIBILITY ONLY] Sanitize downloaded real-world biological FASTA files "
-            "(TreeBASE, OrthoMaM, NCBI Virus) so headers and gap characters are compatible with "
-            "IQ-TREE 2, RAxML-NG, FastTree 2, Fusang, and Phyloformer."
-        )
+        description="[TIER 3 COMPATIBILITY ONLY] Sanitize downloaded real-world biological FASTA files."
     )
-    parser.add_argument("--input-fasta", required=True, help="Path to raw downloaded empirical FASTA file.")
-    parser.add_argument(
-        "--output-fasta",
-        required=True,
-        help="Destination path for cleaned Tier 3 FASTA (e.g., data/01_raw_alignments/tier3/<dataset_id>/alignment.fa).",
-    )
-    parser.add_argument(
-        "--outgroup",
-        default=None,
-        help="Optional outgroup taxon name to verify against the cleaned FASTA headers.",
-    )
-    parser.add_argument(
-        "--seq-type",
-        choices=["DNA", "AA"],
-        default="DNA",
-        help="Sequence alphabet (default: DNA).",
-    )
+    parser.add_argument("--input-fasta", required=True)
+    parser.add_argument("--output-fasta", required=True)
+    parser.add_argument("--outgroup", default=None)
+    parser.add_argument("--seq-type", choices=["AUTO", "DNA", "AA"], default="AUTO")
     args = parser.parse_args()
-
-    print("=" * 78)
-    print(" TIER 3 EMPIRICAL FASTA COMPATIBILITY SANITIZER")
-    print(" (For preparing external real-world FASTAs for Tier 3 pipeline compatibility)")
-    print("=" * 78)
 
     summary = sanitize_tier3_empirical_fasta(
         input_fasta_path=args.input_fasta,
@@ -188,12 +170,9 @@ def main() -> None:
         seq_type=args.seq_type,
     )
 
-    print(f"[+] Input FASTA            : {summary['input_fasta']}")
-    print(f"[+] Cleaned Tier 3 FASTA   : {summary['output_fasta']}")
-    print(f"[+] Taxon Count (N)        : {summary['n_taxa']} (Fusang N<=40 compatible: {summary['fusang_compatible_n_le_40']})")
-    print(f"[+] Alignment Length (L)   : {summary['final_alignment_length']} bp (removed {summary['removed_all_gap_columns']} all-gap columns)")
-    print(f"[+] Designated Outgroup    : {summary['recommended_outgroup']} (Verified: {summary['requested_outgroup_found']})")
-    print(f"[+] Cleaned Taxa Preview   : {', '.join(summary['cleaned_taxa_list'][:6])}...")
+    print(f"[+] Cleaned Tier 3 FASTA ({summary['sequence_type']}): {summary['output_fasta']}")
+    print(f"[+] Taxon Count (N): {summary['n_taxa']} | Length (L): {summary['final_alignment_length']}")
+    print(f"[+] Designated Outgroup: {summary['recommended_outgroup']} (Verified: {summary['requested_outgroup_found']})")
 
 
 if __name__ == "__main__":

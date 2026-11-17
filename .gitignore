@@ -3,6 +3,7 @@
 
 # For user data
 data/
+external_models/
 *.ini
 PROGRESS_PRESENTATION.md
 ### Python ###

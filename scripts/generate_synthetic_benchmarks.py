@@ -4,15 +4,17 @@ CLI Driver for Synthetic Benchmark Generation (Manuscript Section 4.2.2, Table 4
 
 Generates:
   - Tier 1 (Medium-Scale Indel, LBA & Scaling Boundary):
-      N_taxa in {15, 30, 40, 50}, L = 1000
-      Gap column proportions G in {0.05, 0.15, 0.30}
+      N_taxa in {15, 30, 40, 50}, L = 1000, DNA (GTR+G4) & Protein (LG+G4)
+      Native AliSim CTMC Zipfian indels (POW{1.6/30}) at gap proportions G in {0.05, 0.15, 0.30}
       Terminal LBA multipliers k in {2, 10, 40}
   - Tier 2 (Large-Scale Short-Branch, LBA & Recombination):
-      N_taxa in {50, 100, 200}, L in {1000, 2000}
+      N_taxa in {50, 100, 200}, L in {1000, 2000}, DNA & Protein
       Internal branch lengths l_int = 0.002 (< 0.005 substitutions/site)
       Extreme gamma rate heterogeneity alpha = 0.2
       Localized recombinant block = 15% of alignment length L
 """
+from __future__ import annotations
+
 import argparse
 import json
 import sys
@@ -40,7 +42,7 @@ def build_tier1_configs(
         lba_grid = [2.0, 10.0, 40.0]
 
     configs = []
-    seed_counter = 1000
+    seed_counter = 1000 if seq_type.upper() == "DNA" else 3000
     for n_taxa in taxa_grid:
         for gap_prop in gap_grid:
             for k_mult in lba_grid:
@@ -81,7 +83,7 @@ def build_tier2_configs(
         lba_grid = [10.0, 40.0]
 
     configs = []
-    seed_counter = 5000
+    seed_counter = 5000 if seq_type.upper() == "DNA" else 7000
     for n_taxa in taxa_grid:
         for seq_len in len_grid:
             for k_mult in lba_grid:
@@ -110,63 +112,39 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate Tier 1 & Tier 2 Synthetic Stressor Benchmarks via IQ-TREE 2 AliSim."
     )
-    parser.add_argument(
-        "--tier",
-        choices=["1", "2", "both"],
-        default="both",
-        help="Which benchmark tier(s) to generate.",
-    )
-    parser.add_argument(
-        "--replicates",
-        type=int,
-        default=1,
-        help="Number of replicates per parameter grid cell.",
-    )
+    parser.add_argument("--tier", choices=["1", "2", "both"], default="both")
+    parser.add_argument("--replicates", type=int, default=1)
     parser.add_argument(
         "--seq-type",
-        choices=["DNA", "AA"],
+        choices=["DNA", "AA", "both"],
         default="DNA",
-        help="Sequence alphabet (DNA: GTR+G4+I; AA: LG+G4+I).",
+        help="Sequence alphabet ('DNA', 'AA', or 'both' per Table 4.5).",
     )
-    parser.add_argument(
-        "--quick-smoke",
-        action="store_true",
-        help="Generate a reduced smoke-test subset of Tier 1 and Tier 2 configurations.",
-    )
-    parser.add_argument(
-        "--compute-ground-truths",
-        action="store_true",
-        help="Automatically run Pipeline Step 1 (T_true_rooted.nwk, M_true.tsv, A_true.json) for each dataset.",
-    )
-    parser.add_argument(
-        "--out-raw-root",
-        default="data/01_raw_alignments",
-        help="Root directory for generated raw alignments and T_true.nwk.",
-    )
-    parser.add_argument(
-        "--out-gt-root",
-        default="data/02_ground_truths",
-        help="Root directory for ground-truth outputs when --compute-ground-truths is set.",
-    )
+    parser.add_argument("--quick-smoke", action="store_true")
+    parser.add_argument("--compute-ground-truths", action="store_true")
+    parser.add_argument("--out-raw-root", default="data/01_raw_alignments")
+    parser.add_argument("--out-gt-root", default="data/02_ground_truths")
     args = parser.parse_args()
 
+    alphabets = ["DNA", "AA"] if args.seq_type == "both" else [args.seq_type]
     configs = []
-    if args.tier in ("1", "both"):
-        configs.extend(
-            build_tier1_configs(
-                replicates=args.replicates,
-                seq_type=args.seq_type,
-                quick_smoke=args.quick_smoke,
+    for st in alphabets:
+        if args.tier in ("1", "both"):
+            configs.extend(
+                build_tier1_configs(
+                    replicates=args.replicates,
+                    seq_type=st,
+                    quick_smoke=args.quick_smoke,
+                )
             )
-        )
-    if args.tier in ("2", "both"):
-        configs.extend(
-            build_tier2_configs(
-                replicates=args.replicates,
-                seq_type=args.seq_type,
-                quick_smoke=args.quick_smoke,
+        if args.tier in ("2", "both"):
+            configs.extend(
+                build_tier2_configs(
+                    replicates=args.replicates,
+                    seq_type=st,
+                    quick_smoke=args.quick_smoke,
+                )
             )
-        )
 
     manifest = []
     print(f"[*] Generating {len(configs)} synthetic benchmark dataset(s)...")

@@ -12,8 +12,8 @@ single standardized Newick + JSON representation before passing to the Agent:
 
   2. Phyloformer BIONJ Agglomerative Converter (distance_matrix_to_bionj_newick):
      - Validates NxN distance matrices via scikit-bio DistanceMatrix (Aton et al., 2025).
-     - Applies Gascuel (1997) variance-minimizing BIONJ updates (validated against
-       FastME; Lefort et al., 2015) and clamps negative branches to epsilon = 1e-6.
+     - Applies vectorized Gascuel (1997) variance-minimizing BIONJ updates (validated
+       against FastME; Lefort et al., 2015) and clamps negative branches to epsilon = 1e-6.
 
   3. Tree & Support Normalizer — Rules 1, 2 & 3 (standardize_and_root_tree):
      - Rule 1: Universal Outgroup Rooting via ETE 3 (tree.set_outgroup(outgroup)).
@@ -23,16 +23,21 @@ single standardized Newick + JSON representation before passing to the Agent:
                via DendroPy (Sukumaran & Holder, 2010) and assigns placeholder unit
                branch lengths (l_k = 1.0) with "branch_lengths_present": false for Fusang.
 """
+from __future__ import annotations
+
 import json
 from pathlib import Path
-import numpy as np
+
 import dendropy
+import numpy as np
 from Bio import AlignIO
+from Bio.Align import MultipleSeqAlignment
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
-from Bio.Align import MultipleSeqAlignment
 from ete3 import Tree
 from skbio import DistanceMatrix
+
+from src.utils.io_cache import load_alignment_data
 
 
 # ==============================================================================
@@ -47,10 +52,7 @@ def generate_bootstrap_replicates(
 ) -> list[str]:
     """Samples L alignment columns with replacement using NumPy (B = 100 replicates)."""
     rng = np.random.default_rng(seed)
-    alignment = AlignIO.read(fasta_path, "fasta")
-    seq_len = alignment.get_alignment_length()
-    char_matrix = np.array([list(str(rec.seq)) for rec in alignment])
-    taxa_ids = [rec.id for rec in alignment]
+    taxa_ids, char_matrix, seq_len = load_alignment_data(fasta_path)
 
     rep_dir = Path(out_dir) / "bootstrap_reps"
     rep_dir.mkdir(parents=True, exist_ok=True)
@@ -70,7 +72,7 @@ def generate_bootstrap_replicates(
 
 
 # ==============================================================================
-# SECTION 2: PHYLOFORMER DISTANCE MATRIX VALIDATION & BIONJ CONVERSION
+# SECTION 2: PHYLOFORMER DISTANCE MATRIX VALIDATION & VECTORIZED BIONJ
 # ==============================================================================
 
 def to_skbio_distance_matrix(
@@ -97,7 +99,7 @@ def distance_matrix_to_bionj_newick(
 ) -> str:
     """
     Converts a Phyloformer NxN pairwise distance matrix into a clamped BIONJ Newick string
-    using Gascuel (1997) variance-minimizing agglomerative updates.
+    using vectorized Gascuel (1997) variance-minimizing agglomerative updates.
     Validated against reference FastME BIONJ (Lefort et al., 2015); see tests/test_bionj.py.
     """
     dm = to_skbio_distance_matrix(dist_matrix, taxa_labels)
@@ -119,47 +121,46 @@ def distance_matrix_to_bionj_newick(
         if i > j:
             i, j = j, i
 
-        d_ij = D[i, j]
-        v_ij = V[i, j]
-        delta_ij = (row_sums[i] - row_sums[j]) / (r - 2)
+        d_ij = float(D[i, j])
+        v_ij = float(V[i, j])
+        delta_ij = float((row_sums[i] - row_sums[j]) / (r - 2))
 
         l_i_raw = 0.5 * (d_ij + delta_ij)
         l_j_raw = 0.5 * (d_ij - delta_ij)
         l_i = max(l_i_raw, epsilon)
         l_j = max(l_j_raw, epsilon)
 
+        rem_mask = np.ones(r, dtype=bool)
+        rem_mask[i] = False
+        rem_mask[j] = False
+
         if v_ij == 0.0:
             lam = 0.5
         else:
-            lam_num = sum(V[j, k] - V[i, k] for k in range(r) if k != i and k != j)
+            lam_num = float(np.sum(V[j, rem_mask] - V[i, rem_mask]))
             lam = 0.5 + lam_num / (2.0 * (r - 2) * v_ij)
             lam = float(np.clip(lam, 0.0, 1.0))
 
         new_node_str = f"({active_nodes[i]}:{l_i:.6f},{active_nodes[j]}:{l_j:.6f})"
 
-        remaining = [k for k in range(r) if k != i and k != j]
-        new_d = [
-            lam * (D[i, k] - l_i_raw) + (1.0 - lam) * (D[j, k] - l_j_raw)
-            for k in remaining
-        ]
-        new_v = [
-            lam * V[i, k] + (1.0 - lam) * V[j, k] - lam * (1.0 - lam) * v_ij
-            for k in remaining
-        ]
+        new_d = lam * (D[i, rem_mask] - l_i_raw) + (1.0 - lam) * (D[j, rem_mask] - l_j_raw)
+        new_v = lam * V[i, rem_mask] + (1.0 - lam) * V[j, rem_mask] - lam * (1.0 - lam) * v_ij
 
-        D_rem = D[np.ix_(remaining, remaining)]
-        V_rem = V[np.ix_(remaining, remaining)]
-        m = len(remaining)
-        D = np.zeros((m + 1, m + 1), dtype=float)
-        V = np.zeros((m + 1, m + 1), dtype=float)
-        D[:m, :m] = D_rem
-        D[m, :m] = D[:m, m] = new_d
-        V[:m, :m] = V_rem
-        V[m, :m] = V[:m, m] = new_v
+        m = r - 2
+        D_next = np.zeros((m + 1, m + 1), dtype=float)
+        V_next = np.zeros((m + 1, m + 1), dtype=float)
+        D_next[:m, :m] = D[rem_mask][:, rem_mask]
+        D_next[m, :m] = D_next[:m, m] = new_d
+        V_next[:m, :m] = V[rem_mask][:, rem_mask]
+        V_next[m, :m] = V_next[:m, m] = new_v
+        D = D_next
+        V = V_next
 
-        active_nodes = [active_nodes[k] for k in remaining] + [new_node_str]
+        active_nodes = [
+            active_nodes[k] for k in range(r) if k != i and k != j
+        ] + [new_node_str]
 
-    d01, d02, d12 = D[0, 1], D[0, 2], D[1, 2]
+    d01, d02, d12 = float(D[0, 1]), float(D[0, 2]), float(D[1, 2])
     l0 = max(0.5 * (d01 + d02 - d12), epsilon)
     l1 = max(0.5 * (d01 + d12 - d02), epsilon)
     l2 = max(0.5 * (d02 + d12 - d01), epsilon)

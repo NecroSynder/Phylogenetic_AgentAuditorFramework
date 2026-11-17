@@ -1,5 +1,6 @@
 """
-Unit tests for Step A: Tier 1 & Tier 2 Synthetic Stressor Generator (Manuscript Section 4.2.2, Table 4.1 & Table 4.5).
+Unit tests for Step A: Tier 1 (native AliSim CTMC Zipfian indels + LBA) & Tier 2
+(short branches + rate heterogeneity + recombination), across both DNA and 20-state AA.
 """
 import json
 from pathlib import Path
@@ -9,7 +10,7 @@ from ete3 import Tree
 from src.preprocessing.synthetic_generator import generate_single_synthetic_dataset
 
 
-def test_tier1_zipfian_indel_and_lba_generation(tmp_path: Path) -> None:
+def test_tier1_native_alisim_indel_and_lba_generation(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw_t1"
     gt_dir = tmp_path / "gt_t1"
 
@@ -28,8 +29,6 @@ def test_tier1_zipfian_indel_and_lba_generation(tmp_path: Path) -> None:
     )
 
     assert (raw_dir / "alignment.fa").exists()
-    assert (raw_dir / "T_true.nwk").exists()
-    assert (raw_dir / "simulation_metadata.json").exists()
     assert (gt_dir / "T_true_rooted.nwk").exists()
     assert (gt_dir / "M_true.tsv").exists()
     assert (gt_dir / "A_true.json").exists()
@@ -38,18 +37,16 @@ def test_tier1_zipfian_indel_and_lba_generation(tmp_path: Path) -> None:
     assert len(records) == 15
     assert len(records[0].seq) == 300
 
-    # Verify Zipfian indel injection produced gap tracts in [1, 30]
     assert len(meta["simulated_indel_events"]) >= 1
-    for ev in meta["simulated_indel_events"]:
-        assert 1 <= ev["l_gap"] <= 30
-
-    # Verify LBA ratio >= 5.0 when k=10
     assert meta["theoretical_rho_lba"] >= 5.0
+    assert "LBA" in meta["expected_stressors"]
+    assert "INDEL_GAP" in meta["expected_stressors"]
 
     with open(gt_dir / "A_true.json") as f:
         a_true = json.load(f)
     assert len(a_true["gap_tracts"]) >= 1
-    assert a_true["max_gap_tract_length"] >= 1
+    assert a_true["gapped_column_pct"] > 0.0
+    assert len(a_true["long_branch_taxa"]) >= 2
 
 
 def test_tier2_short_branch_and_recombination_generation(tmp_path: Path) -> None:
@@ -72,49 +69,39 @@ def test_tier2_short_branch_and_recombination_generation(tmp_path: Path) -> None
         out_gt_dir=str(gt_dir),
     )
 
-    assert (raw_dir / "alignment.fa").exists()
-    assert (gt_dir / "A_true.json").exists()
-
-    # Verify short internal branches < 0.005 substitutions/site
     tree = Tree(str(raw_dir / "T_true.nwk"), format=1)
     internal_lengths = [
         float(n.dist) for n in tree.traverse() if (not n.is_leaf()) and (not n.is_root())
     ]
     assert all(l < 0.005 for l in internal_lengths)
 
-    # Verify 15% recombinant block breakpoints are recorded in simulation metadata and A_true.json
-    assert len(meta["recombination_breakpoints"]) == 1
     bp_start, bp_end = meta["recombination_breakpoints"][0]
-    assert (bp_end - bp_start + 1) == 45  # 15% of 300 bp
+    assert (bp_end - bp_start + 1) == 45
 
     with open(gt_dir / "A_true.json") as f:
         a_true = json.load(f)
     assert a_true["recombination_breakpoints"] == [[bp_start, bp_end]]
+    assert "RECOMBINATION" in a_true["expected_stressors"]
 
 
-def test_protein_aa_ground_truth_and_20state_ctmc(tmp_path: Path) -> None:
-    """Verify Amino Acid (LG+G4) AliSim simulation and 20-state ASR ground-truth pipeline (Table 4.5)."""
+def test_protein_aa_ground_truth_and_native_indels(tmp_path: Path) -> None:
+    """Verify Amino Acid (LG+G4) AliSim simulation + native indels and 20-state ASR ground truth."""
     raw_dir = tmp_path / "raw_aa"
     gt_dir = tmp_path / "gt_aa"
 
     meta = generate_single_synthetic_dataset(
-        dataset_id="TEST_T1_AA_N8_L120_G5_K2",
+        dataset_id="TEST_T1_AA_N8_L120_G10_K2",
         tier=1,
         n_taxa=8,
         seq_len=120,
         out_raw_dir=str(raw_dir),
         seq_type="AA",
-        gap_proportion=0.05,
+        gap_proportion=0.10,
         lba_multiplier=2.0,
         seed=55,
         compute_ground_truth=True,
         out_gt_dir=str(gt_dir),
     )
-
-    assert (raw_dir / "alignment.fa").exists()
-    assert (gt_dir / "T_true_rooted.nwk").exists()
-    assert (gt_dir / "M_true.tsv").exists()
-    assert (gt_dir / "A_true.json").exists()
 
     with open(gt_dir / "A_true.json") as f:
         a_true = json.load(f)

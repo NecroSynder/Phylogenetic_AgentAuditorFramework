@@ -21,7 +21,6 @@ dependencies:
       - ete3
       - six
       - lxml
-      - pyvcf3
       - pydantic>=2.5
       - langgraph>=0.2
       - langchain-core

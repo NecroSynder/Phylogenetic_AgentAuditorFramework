@@ -1,0 +1,21 @@
+# Isolated Conda Environment for Fusang (Z. Wang et al., 2023; Table 4.2)
+# Upstream repository: https://github.com/Jerry-0591/Fusang (TensorFlow/Keras CNN + Bi-LSTM)
+# Create with:
+#   conda env create -f envs/env_fusang.yml
+name: env_fusang
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.8
+  - numpy<1.24
+  - scipy
+  - pandas<2.1
+  - biopython=1.79
+  - pip
+  - pip:
+      - "tensorflow>=2.8,<2.14"
+      - ete3
+      - six
+      - tqdm
