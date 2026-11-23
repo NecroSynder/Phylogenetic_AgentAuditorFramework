@@ -34,13 +34,14 @@ both target deep-learning models (Fusang, Phyloformer) and the Diagnostic Agent:
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from Bio import AlignIO
+from Bio import AlignIO, SeqIO
 from Bio.Align import MultipleSeqAlignment
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
@@ -70,6 +71,99 @@ def detect_sequence_alphabet(fasta_path: str) -> str:
     if sample_chars and sample_chars.issubset(dna_alphabet):
         return "DNA"
     return "AA"
+
+
+# ==============================================================================
+# SECTION 1B: FLEXIBLE NEWICK LOADING & IQ-TREE MODEL PARSING
+# ==============================================================================
+
+def load_published_tree_safely(raw_text_or_path: str | Path) -> tuple[Tree, bool]:
+    """
+    Loads a reference Newick tree from either a file path or a Newick string,
+    stripping NEXUS/NHX bracket comments ([&R], [&...]), trying ETE3 formats (1, 0, 2, 5),
+    stripping surrounding quotes on taxon names, and detecting whether explicit branch
+    lengths (':<float>') were present in the input.
+    """
+    raw_str = str(raw_text_or_path)
+    p_cand = Path(raw_str)
+    if "\n" not in raw_str and "(" not in raw_str and p_cand.exists():
+        raw_text = p_cand.read_text()
+    else:
+        raw_text = raw_str
+
+    cleaned = re.sub(r"\[[^\]]*\]", "", raw_text).strip()
+    has_explicit_lengths = ":" in cleaned
+    for quoted in (True, False):
+        for fmt in (1, 0, 2, 5):
+            try:
+                t = Tree(cleaned, format=fmt, quoted_node_names=quoted)
+                for lf in t.iter_leaves():
+                    lf.name = lf.name.strip("'\"")
+                if has_explicit_lengths:
+                    non_root_dists = [float(n.dist) for n in t.traverse() if not n.is_root()]
+                    if non_root_dists and all(abs(d - 1.0) < 1e-9 for d in non_root_dists):
+                        has_explicit_lengths = False
+                return t, has_explicit_lengths
+            except Exception:
+                continue
+    raise ValueError(f"Unable to parse Newick tree: {str(raw_text_or_path)[:120]}")
+
+
+def parse_iqtree_best_model(iqtree_report_path: str | Path) -> str | None:
+    """Extracts the ModelFinder best-fit substitution model from an IQ-TREE .iqtree report."""
+    p = Path(iqtree_report_path)
+    if not p.exists():
+        return None
+    text = p.read_text(errors="replace")
+    for pattern in (
+        r"Best-fit model according to \w+:\s*(\S+)",
+        r"Model of substitution:\s*(\S+)",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _transfer_ml_branch_lengths_to_rooted_tree(
+    rooted_tree: Tree,
+    ml_treefile_path: Path,
+    outgroup: str,
+) -> None:
+    """
+    Transfers ML-optimized branch lengths from IQ-TREE's .treefile onto a branchless
+    outgroup-rooted reference pedigree (preserving exact rooted topology and N1..Nk labels).
+    """
+    if not ml_treefile_path.exists():
+        return
+    t_ml, _ = load_published_tree_safely(ml_treefile_path)
+    all_leaves = set(t_ml.get_leaf_names())
+
+    leaf_dists = {lf.name: max(float(lf.dist), 1e-6) for lf in t_ml.iter_leaves()}
+    split_dists: dict[frozenset[str], float] = {}
+    for node in t_ml.traverse():
+        if node.is_root() or node.is_leaf():
+            continue
+        canon = _outgroup_excluding_split(set(node.get_leaf_names()), all_leaves, outgroup)
+        if canon:
+            split_dists[canon] = max(float(node.dist), 1e-6)
+
+    og_total = leaf_dists.get(outgroup, 0.02)
+    ingroup_children = [c for c in rooted_tree.children if not c.is_leaf()]
+
+    for node in rooted_tree.traverse("postorder"):
+        if node.is_root():
+            node.dist = 0.0
+        elif node.is_leaf():
+            if node.name == outgroup:
+                node.dist = round(max(og_total * 0.5, 1e-6), 6)
+            else:
+                node.dist = round(leaf_dists.get(node.name, 1e-6), 6)
+        elif ingroup_children and node is ingroup_children[0]:
+            node.dist = round(max(og_total * 0.5, 1e-6), 6)
+        else:
+            canon = _outgroup_excluding_split(set(node.get_leaf_names()), all_leaves, outgroup)
+            node.dist = round(split_dists.get(canon, 1e-6), 6)
 
 
 # ==============================================================================
@@ -533,25 +627,42 @@ def run_ground_truth_pipeline(
     auto_scan_recombination: bool = False,
     expected_stressors: list[str] | None = None,
     verified_consensus_splits: list[list[str]] | None = None,
+    substitution_model: str | None = None,
+    experimental_ancestors_fasta: str | None = None,
+    cataloged_mutations: list[dict] | None = None,
+    kept_original_columns_1based: list[int] | None = None,
+    documented_lba_taxa: list[str] | None = None,
+    documented_clade_anomalies: list[dict] | None = None,
 ) -> dict:
     """
     Executes Pipeline Step 1 to generate:
       - T_true_rooted.nwk (Outgroup-rooted reference tree with post-order N1..Nk labels)
-      - M_true.tsv        (Verified branch ASR substitutions with .sitelh delta_SLS & Fitch indel synapomorphies)
+      - M_true.tsv        (Verified branch ASR substitutions / sequenced ancestors / cataloged mutations
+                           with .sitelh delta_SLS & Fitch indel synapomorphies)
       - A_true.json       (Informative-site CI/RI, LBA metrics, gap tracts, and recombination intervals)
-    Supports both DNA (GTR+G4) and Amino Acid / Protein (LG+G4) alignments.
+    Supports both DNA (GTR+G4 or ModelFinder) and Amino Acid / Protein (LG+G4 or ModelFinder) alignments.
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     # 1. Universal Outgroup Rooting & Deterministic Post-Order Node Labeling on T_true
-    t_true = Tree(true_tree_path, format=1)
+    t_true, input_has_branch_lengths = load_published_tree_safely(true_tree_path)
     t_true.set_outgroup(t_true & outgroup)
+    orig_internal_to_nk: dict[str, str] = {}
+    clade_to_nk: dict[frozenset[str], tuple[str, str]] = {}
     k_idx = 1
     for node in t_true.traverse("postorder"):
         if not node.is_leaf():
-            node.name = f"N{k_idx}"
+            old_name = str(node.name).strip() if node.name else ""
+            new_name = f"N{k_idx}"
+            if old_name and not old_name.replace(".", "", 1).isdigit():
+                orig_internal_to_nk[old_name] = new_name
+            node.name = new_name
             k_idx += 1
+    for node in t_true.traverse("postorder"):
+        if not node.is_leaf() and not node.is_root():
+            clade_to_nk[frozenset(node.get_leaf_names())] = (node.up.name, node.name)
+
     rooted_true_path = out_path / "T_true_rooted.nwk"
     t_true.write(format=1, outfile=str(rooted_true_path))
 
@@ -559,7 +670,8 @@ def run_ground_truth_pipeline(
     taxa_ids, char_mat, seq_len = load_alignment_data(fasta_path)
     n_taxa = len(taxa_ids)
     seq_type = detect_sequence_alphabet(fasta_path)
-    iq_model = "GTR+G4" if seq_type == "DNA" else "LG+G4"
+    default_iq_model = "GTR+G4" if seq_type == "DNA" else "LG+G4"
+    iq_model_arg = substitution_model if substitution_model else default_iq_model
     uniform_prior = 0.25 if seq_type == "DNA" else 0.05
     nt_arg = str(default_cpu_threads(4)) if (n_taxa * seq_len >= 50000) else "1"
 
@@ -572,7 +684,7 @@ def run_ground_truth_pipeline(
         "-te",
         str(rooted_true_path),
         "-m",
-        iq_model,
+        iq_model_arg,
         "--ancestral",
         "-wsl",
         "-nt",
@@ -584,12 +696,22 @@ def run_ground_truth_pipeline(
     ]
     subprocess.run(cmd, check=True)
 
+    resolved_iq_model = parse_iqtree_best_model(Path(f"{prefix}.iqtree")) or (
+        default_iq_model if iq_model_arg.upper() == "MFP" else iq_model_arg
+    )
+
+    # 2a. If published reference tree lacked branch lengths, populate ML lengths from iqtree_asr.treefile
+    asr_treefile = Path(f"{prefix}.treefile")
+    if not input_has_branch_lengths and asr_treefile.exists():
+        _transfer_ml_branch_lengths_to_rooted_tree(t_true, asr_treefile, outgroup)
+        t_true.write(format=1, outfile=str(rooted_true_path))
+
     # 2b. Compute exact Felsenstein branch-collapse delta_SLS_i(b) from .sitelh
     delta_sls_by_child = compute_branch_delta_sls_matrix(
         fasta_path=fasta_path,
         iqtree_bin=iqtree_bin,
-        iq_model=iq_model,
-        asr_treefile_path=Path(f"{prefix}.treefile"),
+        iq_model=resolved_iq_model,
+        asr_treefile_path=asr_treefile,
         rooted_true_tree=t_true,
         outgroup=outgroup,
         work_dir=out_path,
@@ -622,18 +744,35 @@ def run_ground_truth_pipeline(
             "gap_ci_i": round(float(gap_ci_arr[col_idx]), 4),
         }
 
-    # 5. Build M_true (Causal Mutations per branch u -> v: ASR substitutions + Fitch Indel synapomorphies)
+    # Optional Tier 1 directly sequenced experimental ancestors lookup (mapped to N1..Nk)
+    exp_ancestor_seqs: dict[str, str] = {}
+    if experimental_ancestors_fasta and Path(experimental_ancestors_fasta).exists():
+        for rec in SeqIO.parse(str(experimental_ancestors_fasta), "fasta"):
+            raw_anc_id = rec.id.strip()
+            mapped_id = orig_internal_to_nk.get(raw_anc_id, raw_anc_id)
+            s_anc = str(rec.seq).upper().replace(".", "-").replace("?", "-").replace("*", "-")
+            if (
+                kept_original_columns_1based
+                and len(s_anc) != seq_len
+                and len(s_anc) >= max(kept_original_columns_1based)
+            ):
+                s_anc = "".join(s_anc[pos_1 - 1] for pos_1 in kept_original_columns_1based)
+            if len(s_anc) != seq_len:
+                raise ValueError(
+                    f"Experimental ancestor '{raw_anc_id}' in {experimental_ancestors_fasta} has length "
+                    f"{len(s_anc)}, expected aligned sequence length {seq_len}."
+                )
+            exp_ancestor_seqs[mapped_id] = s_anc
+
+    # 5. Build M_true (Causal Mutations per branch u -> v: Sequenced Ancestors + ASR + Fitch Indels)
     node_state_lookup = state_df.set_index(["Node", "Site"]).to_dict(orient="index")
-    # Root node itself may not appear in unrooted IQ-TREE .state; map root to ingroup root N_{K} if needed
     root_node_name = t_true.name
     ingroup_children = [c for c in t_true.children if not c.is_leaf()]
     fallback_root_asr_name = ingroup_children[0].name if ingroup_children else None
 
-    m_true_records = []
+    m_true_by_key: dict[tuple[str, str, int], dict] = {}
     indel_boundaries_by_branch = {}
     is_gap_int_mat = (char_mat == "-").astype(int)
-    in_clade_idx_cache: dict[str, np.ndarray] = {}
-    taxon_to_idx = {tid: idx for idx, tid in enumerate(taxa_ids)}
 
     for node in t_true.traverse("postorder"):
         if node.is_root() or node.is_leaf():
@@ -641,8 +780,6 @@ def run_ground_truth_pipeline(
         u_name = node.up.name
         v_name = node.name
         clade_taxa = set(node.get_leaf_names())
-        in_mask = np.array([tid in clade_taxa for tid in taxa_ids], dtype=bool)
-        in_clade_idx_cache[v_name] = in_mask
 
         # 5a. Contiguous indel boundaries [i_start, i_end] supporting branch u -> v
         g_u_vec = gap_node_states.get(u_name)
@@ -684,6 +821,8 @@ def run_ground_truth_pipeline(
 
         branch_sls_vec = delta_sls_by_child.get(v_name)
         asr_u_key = fallback_root_asr_name if (u_name == root_node_name and fallback_root_asr_name) else u_name
+        exp_u_seq = exp_ancestor_seqs.get(u_name) or exp_ancestor_seqs.get(asr_u_key or "")
+        exp_v_seq = exp_ancestor_seqs.get(v_name)
 
         for site_i in range(1, seq_len + 1):
             col_0 = site_i - 1
@@ -691,24 +830,44 @@ def run_ground_truth_pipeline(
                 g_u, g_v, tract_str = site_to_tract[site_i]
                 bin_col_dict = {taxa_ids[r]: int(is_gap_int_mat[r, col_0]) for r in range(n_taxa)}
                 mi_bits = shannon_mutual_information_gap_bits(bin_col_dict, clade_taxa)
-                # Representative non-gap base/residue on the non-gapped side for human-readable state grounding
                 non_gap_chars = [ch for ch in char_mat[:, col_0] if ch not in AMBIGUOUS_CHARS]
                 consensus_char = max(set(non_gap_chars), key=non_gap_chars.count) if non_gap_chars else "CHAR"
-                m_true_records.append(
-                    {
+                m_true_by_key[(u_name, v_name, site_i)] = {
+                    "parent_node": u_name,
+                    "child_node": v_name,
+                    "site": site_i,
+                    "parent_state": "-" if g_u == 1 else consensus_char,
+                    "child_state": "-" if g_v == 1 else consensus_char,
+                    "posterior_prob": 1.0,
+                    "delta_sls": max(mi_bits, 1e-4),
+                    "is_indel": True,
+                    "ci_score": site_metrics[site_i]["gap_ci_i"],
+                    "indel_boundary": tract_str,
+                }
+                continue
+
+            if exp_u_seq is not None and exp_v_seq is not None:
+                su_exp = exp_u_seq[col_0]
+                sv_exp = exp_v_seq[col_0]
+                if (
+                    su_exp != sv_exp
+                    and su_exp not in AMBIGUOUS_CHARS
+                    and sv_exp not in AMBIGUOUS_CHARS
+                ):
+                    raw_dsls = float(branch_sls_vec[col_0]) if branch_sls_vec is not None else 1.0
+                    m_true_by_key[(u_name, v_name, site_i)] = {
                         "parent_node": u_name,
                         "child_node": v_name,
                         "site": site_i,
-                        "parent_state": "-" if g_u == 1 else consensus_char,
-                        "child_state": "-" if g_v == 1 else consensus_char,
+                        "parent_state": su_exp,
+                        "child_state": sv_exp,
                         "posterior_prob": 1.0,
-                        "delta_sls": max(mi_bits, 1e-4),
-                        "is_indel": True,
-                        "ci_score": site_metrics[site_i]["gap_ci_i"],
-                        "indel_boundary": tract_str,
+                        "delta_sls": round(max(raw_dsls, 0.01), 4),
+                        "is_indel": False,
+                        "ci_score": site_metrics[site_i]["ci_i"],
+                        "indel_boundary": "",
                     }
-                )
-                continue
+                    continue
 
             u_row = node_state_lookup.get((asr_u_key, site_i))
             v_row = node_state_lookup.get((v_name, site_i))
@@ -720,23 +879,74 @@ def run_ground_truth_pipeline(
                         exact_dsls = float(branch_sls_vec[col_0])
                     else:
                         exact_dsls = float(np.log(min(p_u, p_v) / uniform_prior))
-                    # Retain strictly positive site log-likelihood support delta_SLS_i(b) > 0 (Section 4.1.1 Item 2.1)
                     if exact_dsls > 1e-6:
-                        m_true_records.append(
-                            {
-                                "parent_node": u_name,
-                                "child_node": v_name,
-                                "site": site_i,
-                                "parent_state": s_u,
-                                "child_state": s_v,
-                                "posterior_prob": round(min(p_u, p_v), 4),
-                                "delta_sls": round(exact_dsls, 4),
-                                "is_indel": False,
-                                "ci_score": site_metrics[site_i]["ci_i"],
-                                "indel_boundary": "",
-                            }
-                        )
+                        m_true_by_key[(u_name, v_name, site_i)] = {
+                            "parent_node": u_name,
+                            "child_node": v_name,
+                            "site": site_i,
+                            "parent_state": s_u,
+                            "child_state": s_v,
+                            "posterior_prob": round(min(p_u, p_v), 4),
+                            "delta_sls": round(exact_dsls, 4),
+                            "is_indel": False,
+                            "ci_score": site_metrics[site_i]["ci_i"],
+                            "indel_boundary": "",
+                        }
 
+    if cataloged_mutations:
+        orig_col_lookup = (
+            {orig_c: idx + 1 for idx, orig_c in enumerate(kept_original_columns_1based)}
+            if kept_original_columns_1based
+            else None
+        )
+        nk_to_parent = {
+            n.name: n.up.name
+            for n in t_true.traverse("postorder")
+            if not n.is_root() and not n.is_leaf()
+        }
+        for cm in cataloged_mutations:
+            raw_site = int(cm.get("site", cm.get("site_coordinate", -1)))
+            mapped_site = (
+                orig_col_lookup.get(raw_site)
+                if (orig_col_lookup is not None and not cm.get("already_cleaned_coordinates", False))
+                else raw_site
+            )
+            if mapped_site is None or mapped_site < 1 or mapped_site > seq_len:
+                continue
+
+            target_pair: tuple[str, str] | None = None
+            if cm.get("clade_taxa"):
+                target_pair = clade_to_nk.get(frozenset(cm["clade_taxa"]))
+            elif cm.get("child_node"):
+                c_raw = str(cm["child_node"])
+                c_nk = orig_internal_to_nk.get(c_raw, c_raw)
+                if c_nk in nk_to_parent:
+                    target_pair = (nk_to_parent[c_nk], c_nk)
+            if not target_pair:
+                continue
+
+            u_cat, v_cat = target_pair
+            su_cat = str(cm.get("parent_state", cm.get("ancestral_state", ""))).upper()
+            sv_cat = str(cm.get("child_state", cm.get("derived_state", ""))).upper()
+            if not su_cat or not sv_cat or su_cat == sv_cat:
+                continue
+            is_ind = bool(cm.get("is_indel", "-" in {su_cat, sv_cat}))
+            b_vec = delta_sls_by_child.get(v_cat)
+            dsls_val = float(b_vec[mapped_site - 1]) if b_vec is not None else 1.0
+            m_true_by_key[(u_cat, v_cat, mapped_site)] = {
+                "parent_node": u_cat,
+                "child_node": v_cat,
+                "site": mapped_site,
+                "parent_state": su_cat,
+                "child_state": sv_cat,
+                "posterior_prob": 1.0,
+                "delta_sls": round(max(dsls_val, 0.01), 4),
+                "is_indel": is_ind,
+                "ci_score": site_metrics[mapped_site]["gap_ci_i" if is_ind else "ci_i"],
+                "indel_boundary": str(mapped_site) if is_ind else "",
+            }
+
+    m_true_records = list(m_true_by_key.values())
     m_true_df = pd.DataFrame(
         m_true_records,
         columns=[
@@ -766,16 +976,20 @@ def run_ground_truth_pipeline(
         if not n.is_leaf() and not n.is_root() and n.dist > 0
     }
     int_dists = list(internal_branch_lengths.values())
-    rho_lba = (max(term_dists) / min(int_dists)) if (term_dists and int_dists) else 1.0
+    resolved_int_dists = [d for d in int_dists if d > 1e-5]
+    denom_min_int = min(resolved_int_dists) if resolved_int_dists else (min(int_dists) if int_dists else 0.05)
+    rho_lba = (max(term_dists) / max(denom_min_int, 1e-4)) if term_dists else 1.0
 
     median_leaf_len = float(np.median(term_dists)) if term_dists else 0.05
-    long_branch_taxa = sorted(
+    detected_long_taxa = {
         leaf.name
         for leaf in t_true.iter_leaves()
         if leaf.name != outgroup and float(leaf.dist) >= max(median_leaf_len * 2.5, 0.10)
-    )
+    }
+    if documented_lba_taxa:
+        detected_long_taxa.update(t for t in documented_lba_taxa if t in leaf_branch_lengths)
+    long_branch_taxa = sorted(detected_long_taxa)
 
-    # Informative-only CI and RI (excluding invariant s_i == 0 columns so homoplasy is never diluted)
     var_mask = s_arr > 0
     mean_inf_ci = float(np.mean(ci_arr[var_mask])) if np.any(var_mask) else 1.0
     ensemble_ci = (
@@ -784,7 +998,6 @@ def run_ground_truth_pipeline(
     inf_ri_mask = (g_arr > m_arr) & (s_arr > 0)
     mean_inf_ri = float(np.mean(ri_arr[inf_ri_mask])) if np.any(inf_ri_mask) else 1.0
 
-    # Contiguous alignment-wide gap tracts L_gap (Table 4.1)
     gap_cols = [int(i + 1) for i in np.flatnonzero(gap_pct_arr > 0.0)]
     gapped_col_pct = round((len(gap_cols) / max(seq_len, 1)) * 100.0, 2)
     gap_tracts = []
@@ -807,29 +1020,40 @@ def run_ground_truth_pipeline(
             rooted_true_path=str(rooted_true_path),
         )
 
-    # Derive deterministic ground-truth stressor tags when not explicitly passed
-    min_int_len = min(int_dists) if int_dists else 0.05
+    min_int_len = denom_min_int
     if expected_stressors is not None:
         gt_stressors = list(expected_stressors)
     else:
         gt_stressors = []
+        if documented_clade_anomalies:
+            for item in documented_clade_anomalies:
+                st_lbl = str(item.get("stressor", "")).strip()
+                if st_lbl and st_lbl not in gt_stressors:
+                    gt_stressors.append(st_lbl)
         if rho_lba >= 5.0 and len(long_branch_taxa) >= 1:
-            gt_stressors.append(
-                "SHORT_BRANCH_HOMOPLASY_AND_LBA" if min_int_len < 0.005 else "LBA"
-            )
+            tag = "SHORT_BRANCH_HOMOPLASY_AND_LBA" if min_int_len < 0.005 else "LBA"
+            if tag not in gt_stressors:
+                gt_stressors.append(tag)
         if gapped_col_pct >= 12.0 or float(np.mean(gap_pct_arr)) >= 10.0:
-            gt_stressors.append("INDEL_GAP")
-        if recomb_list:
+            if "INDEL_GAP" not in gt_stressors:
+                gt_stressors.append("INDEL_GAP")
+        if recomb_list and "RECOMBINATION" not in gt_stressors:
             gt_stressors.append("RECOMBINATION")
         if min_int_len < 0.005 or mean_inf_ci < 0.65:
-            if "SHORT_BRANCH_HOMOPLASY_AND_LBA" not in gt_stressors:
+            if (
+                "SHORT_BRANCH_HOMOPLASY_AND_LBA" not in gt_stressors
+                and "SHORT_BRANCH_HOMOPLASY" not in gt_stressors
+            ):
                 gt_stressors.append("SHORT_BRANCH_HOMOPLASY")
 
     a_true = {
         "sequence_alphabet": seq_type,
+        "substitution_model": resolved_iq_model,
+        "input_tree_had_branch_lengths": input_has_branch_lengths,
         "outgroup_taxon": outgroup,
         "global_rho_lba": round(rho_lba, 3),
         "min_internal_branch_length": round(min_int_len, 6),
+        "raw_min_internal_branch_length": round(min(int_dists), 6) if int_dists else round(min_int_len, 6),
         "leaf_branch_lengths": leaf_branch_lengths,
         "internal_branch_lengths": internal_branch_lengths,
         "long_branch_taxa": long_branch_taxa,
@@ -845,6 +1069,7 @@ def run_ground_truth_pipeline(
         "branch_indel_synapomorphies": indel_boundaries_by_branch,
         "recombination_breakpoints": recomb_list,
         "expected_stressors": gt_stressors,
+        "documented_clade_anomalies": documented_clade_anomalies or [],
         "verified_consensus_splits": verified_consensus_splits,
         "site_metrics": site_metrics,
     }

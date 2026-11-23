@@ -22,6 +22,7 @@ from src.preprocessing.target_model_runner import (
     detect_sequence_alphabet,
     run_target_model_pipeline,
 )
+from src.utils.io_cache import load_dataset_metadata
 
 
 def main() -> None:
@@ -70,15 +71,18 @@ def main() -> None:
     else:
         raw_root = Path(args.raw_root)
         for fa_path in sorted(raw_root.rglob("alignment.fa")):
-            ds_id = fa_path.parent.name
+            ds_meta = load_dataset_metadata(fa_path)
+            ds_id = ds_meta.get("dataset_id") or fa_path.parent.name
             tier_dir = fa_path.parent.parent.name
-            sim_meta_path = fa_path.parent / "simulation_metadata.json"
-            outgroup = args.outgroup
-            if outgroup is None and sim_meta_path.exists():
-                with open(sim_meta_path) as f:
-                    outgroup = json.load(f).get("outgroup_taxon")
+            outgroup = args.outgroup or ds_meta.get("outgroup_taxon")
             tasks.append(
-                {"dataset_id": ds_id, "tier_dir": tier_dir, "fasta_path": fa_path, "outgroup": outgroup}
+                {
+                    "dataset_id": ds_id,
+                    "tier_dir": tier_dir,
+                    "fasta_path": fa_path,
+                    "outgroup": outgroup,
+                    "substitution_model": ds_meta.get("substitution_model"),
+                }
             )
 
     if not tasks:
@@ -119,6 +123,7 @@ def main() -> None:
                 phyloformer_batch_cmd_template=args.phyloformer_batch_cmd,
                 allow_surrogate=args.use_surrogate,
                 max_workers=args.workers,
+                substitution_model=item.get("substitution_model"),
             )
             if meta is None:
                 print(f"    [Skipped] {model_name} skipped for {ds_id} (N > 40 scaling constraint).")

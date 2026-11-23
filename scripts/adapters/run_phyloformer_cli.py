@@ -126,14 +126,46 @@ def _load_phyloformer_model(repo_dir: Path, checkpoint_path: Path, device: str):
 
 def _predict_phyloformer_pairs(
     model, pf_model_mod, aln_tensor: torch.Tensor, device: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, str]:
     n_taxa = int(aln_tensor.shape[-1])
     if n_taxa > int(pf_model_mod.SEQ2PAIR.shape[1]):
         pf_model_mod.SEQ2PAIR = pf_model_mod.seq2pair(n_taxa)
         model.n_seqs = -1  # force _set_seq2pair rebuild against expanded SEQ2PAIR
+
+    if device == "cuda":
+        try:
+            if str(model.seq2pair.device) != str(torch.device("cuda")) and model.seq2pair.device.type != "cuda":
+                model.seq2pair = model.seq2pair.to("cuda")
+            out = model(aln_tensor[None, :].to("cuda").float())
+            if n_taxa >= 100:
+                torch.cuda.empty_cache()
+            return out, "cuda"
+        except torch.cuda.OutOfMemoryError:
+            # Reset n_seqs=-1 in case OOM occurred inside _set_seq2pair after self.n_seqs was mutated
+            model.n_seqs = -1
+            torch.cuda.empty_cache()
+            try:
+                if str(model.seq2pair.device) != str(torch.device("cuda")) and model.seq2pair.device.type != "cuda":
+                    model.seq2pair = model.seq2pair.to("cuda")
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    out_fp16 = model(aln_tensor[None, :].to("cuda").float())
+                torch.cuda.empty_cache()
+                return out_fp16.float(), "cuda"
+            except torch.cuda.OutOfMemoryError:
+                print(
+                    f"[Phyloformer Adapter] CUDA OOM at N={n_taxa} taxa; switching batch execution to CPU.",
+                    file=sys.stderr,
+                )
+                model.n_seqs = -1
+                torch.cuda.empty_cache()
+                model.to("cpu")
+                model.seq2pair = model.seq2pair.to("cpu")
+                out_cpu = model(aln_tensor[None, :].to("cpu").float())
+                return out_cpu, "cpu"
+
     if str(model.seq2pair.device) != str(torch.device(device)) and model.seq2pair.device.type != device:
         model.seq2pair = model.seq2pair.to(device)
-    return model(aln_tensor[None, :].to(device).float())
+    return model(aln_tensor[None, :].to(device).float()), device
 
 
 def _preds_to_symmetric_numpy(preds: torch.Tensor, n_taxa: int) -> np.ndarray:
@@ -200,7 +232,7 @@ def main() -> None:
             )
             for idx, fa in enumerate(fasta_files, start=1):
                 aln_tensor, ids = _encode_protein_msa_for_phyloformer(fa)
-                preds = _predict_phyloformer_pairs(model, pf_model_mod, aln_tensor, device)
+                preds, device = _predict_phyloformer_pairs(model, pf_model_mod, aln_tensor, device)
                 D = _preds_to_symmetric_numpy(preds, len(ids))
                 np.save(str(out_dir / f"{fa.stem}.npy"), D)
                 if idx == 1 or idx == total or idx % 10 == 0:
@@ -214,7 +246,7 @@ def main() -> None:
             out_mat = Path(args.output_matrix).resolve()
             out_mat.parent.mkdir(parents=True, exist_ok=True)
             aln_tensor, ids = _encode_protein_msa_for_phyloformer(src_fa)
-            preds = _predict_phyloformer_pairs(model, pf_model_mod, aln_tensor, device)
+            preds, device = _predict_phyloformer_pairs(model, pf_model_mod, aln_tensor, device)
             D = _preds_to_symmetric_numpy(preds, len(ids))
             np.save(str(out_mat), D)
         else:

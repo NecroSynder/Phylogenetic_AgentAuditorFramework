@@ -62,6 +62,18 @@ def _extract_summary_row(
         if nodes
         else 0.0
     )
+    mean_ig = (
+        round(
+            float(
+                np.mean(
+                    [n["explanation_quality_vector"]["information_gain_ig"] for n in nodes]
+                )
+            ),
+            4,
+        )
+        if nodes
+        else 0.0
+    )
     mean_fgs = (
         round(
             float(
@@ -69,6 +81,22 @@ def _extract_summary_row(
                     [n["explanation_quality_vector"]["faithfulness_fgs"] for n in nodes]
                 )
             ),
+            4,
+        )
+        if nodes
+        else 0.0
+    )
+    mean_bsf = (
+        round(
+            float(np.mean([n["explanation_quality_vector"]["bsf_local"] for n in nodes])),
+            4,
+        )
+        if nodes
+        else 0.0
+    )
+    mean_g_node = (
+        round(
+            float(np.mean([float(n["node_goodness_score"]) for n in nodes])),
             4,
         )
         if nodes
@@ -91,12 +119,21 @@ def _extract_summary_row(
         else llm_model_id,
         "rf_norm": float(gm["normalized_rf_distance"]),
         "fci_global": float(gm["false_confidence_index_fci"]),
+        "conditional_fci": float(gm.get("conditional_fci", 0.0)),
         "ccvr": float(gm["claim_to_coordinate_verification_rate"]),
+        "bsf": mean_bsf,
         "lcr": float(gm["logical_consistency_rate_lcr"]),
+        "mean_g_node": mean_g_node,
         "g_tree": float(gm["overall_tree_goodness_score"]),
         "mean_feature_f1": mean_f1,
+        "mean_ig": mean_ig,
         "mean_fgs": mean_fgs,
         "edr": edr_val,
+        "total_internal_nodes_audited": int(gm["total_internal_nodes_audited"]),
+        "false_confidence_nodes_count": int(gm["false_confidence_nodes_count"]),
+        "total_hallucination_retries_triggered": int(
+            gm.get("total_hallucination_retries_triggered", 0)
+        ),
         "report_json_path": str(json_path),
     }
 
@@ -110,24 +147,35 @@ def _upsert_master_tsv(tsv_path: Path, new_rows: list[dict]) -> pd.DataFrame:
         "llm_model_id",
         "rf_norm",
         "fci_global",
+        "conditional_fci",
         "ccvr",
+        "bsf",
         "lcr",
+        "mean_g_node",
         "g_tree",
         "mean_feature_f1",
+        "mean_ig",
         "mean_fgs",
         "edr",
+        "total_internal_nodes_audited",
+        "false_confidence_nodes_count",
+        "total_hallucination_retries_triggered",
         "report_json_path",
     ]
+    int_cols = {
+        "total_internal_nodes_audited",
+        "false_confidence_nodes_count",
+        "total_hallucination_retries_triggered",
+    }
     new_df = pd.DataFrame(new_rows)
     for c in cols:
         if c not in new_df.columns:
-            new_df[c] = 0.0
+            new_df[c] = 0 if c in int_cols else 0.0
     new_df = new_df[cols]
 
     if tsv_path.exists():
         existing_df = pd.read_csv(tsv_path, sep="\t")
         existing_df.columns = [c.lower() if c.lower() in cols else c for c in existing_df.columns]
-        # Harmonize legacy column names if present
         rename_map = {
             "CCVR": "ccvr",
             "LCR": "lcr",
@@ -139,7 +187,7 @@ def _upsert_master_tsv(tsv_path: Path, new_rows: list[dict]) -> pd.DataFrame:
         existing_df = existing_df.rename(columns=rename_map)
         for c in cols:
             if c not in existing_df.columns:
-                existing_df[c] = 0.0
+                existing_df[c] = 0 if c in int_cols else 0.0
         combined = pd.concat([existing_df[cols], new_df], ignore_index=True)
         combined = combined.drop_duplicates(
             subset=["dataset_id", "target_model", "auditor_method", "llm_model_id"],
@@ -148,9 +196,177 @@ def _upsert_master_tsv(tsv_path: Path, new_rows: list[dict]) -> pd.DataFrame:
     else:
         combined = new_df
 
+    for ic in int_cols:
+        combined[ic] = combined[ic].fillna(0).astype(int)
+
     tsv_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(tsv_path, sep="\t", index=False, float_format="%.4f")
     return combined
+
+
+def _recompute_replicate_suite_from_master(
+    master_df: pd.DataFrame,
+    stat_dir: Path,
+    current_is_mock: bool,
+    agent_model: str,
+    zeroshot_model: str,
+    generic_agent_model: str,
+    allowed_dataset_ids: set[str] | None = None,
+) -> dict:
+    """Recomputes replicate_level_statistical_suite.json across strictly matched, uncontaminated pairs."""
+    is_mock_mask = master_df["llm_model_id"].astype(str).str.contains(
+        "OFFLINE_DETERMINISTIC_MOCK", na=False
+    )
+    if current_is_mock:
+        filtered_df = master_df[is_mock_mask].copy()
+    else:
+        filtered_df = master_df[~is_mock_mask].copy()
+        active_llm_set = {str(agent_model), str(zeroshot_model), str(generic_agent_model)}
+        filtered_df = filtered_df[filtered_df["llm_model_id"].astype(str).isin(active_llm_set)]
+
+    if allowed_dataset_ids is not None:
+        filtered_df = filtered_df[filtered_df["dataset_id"].astype(str).isin(allowed_dataset_ids)]
+
+    prop_sub = filtered_df[filtered_df["auditor_method"] == "Proposed_4State_Agent"].drop_duplicates(
+        subset=["dataset_id", "target_model"], keep="last"
+    )
+    b1_sub = filtered_df[filtered_df["auditor_method"] == "Baseline1_ZeroShot_LLM"].drop_duplicates(
+        subset=["dataset_id", "target_model"], keep="last"
+    )
+    b2_sub = filtered_df[filtered_df["auditor_method"] == "Baseline2_Generic_Agent"].drop_duplicates(
+        subset=["dataset_id", "target_model"], keep="last"
+    )
+
+    shared_keys = (
+        set(zip(prop_sub["dataset_id"], prop_sub["target_model"]))
+        & set(zip(b1_sub["dataset_id"], b1_sub["target_model"]))
+        & set(zip(b2_sub["dataset_id"], b2_sub["target_model"]))
+    )
+    if len(shared_keys) < 2:
+        return {}
+
+    key_order = sorted(shared_keys)
+    prop_indexed = prop_sub.set_index(["dataset_id", "target_model"])
+    b1_indexed = b1_sub.set_index(["dataset_id", "target_model"])
+    b2_indexed = b2_sub.set_index(["dataset_id", "target_model"])
+
+    prop_recs = [prop_indexed.loc[k].to_dict() for k in key_order]
+    b1_recs = [b1_indexed.loc[k].to_dict() for k in key_order]
+    b2_recs = [b2_indexed.loc[k].to_dict() for k in key_order]
+
+    ccvr_b1, bsf_b1 = _collect_pooled_node_binaries(prop_recs, b1_recs)
+    ccvr_b2, bsf_b2 = _collect_pooled_node_binaries(prop_recs, b2_recs)
+
+    replicate_suite = {
+        "mode": "offline_mock" if current_is_mock else f"live_llm:{agent_model}",
+        "vs_baseline1_zeroshot_across_replicates": run_replicate_statistical_suite(
+            prop_recs,
+            b1_recs,
+            pooled_node_ccvr=ccvr_b1,
+            pooled_node_bsf=bsf_b1,
+        ),
+        "vs_baseline2_generic_across_replicates": run_replicate_statistical_suite(
+            prop_recs,
+            b2_recs,
+            pooled_node_ccvr=ccvr_b2,
+            pooled_node_bsf=bsf_b2,
+        ),
+    }
+    if not current_is_mock or not (stat_dir / "replicate_level_statistical_suite.json").exists():
+        with open(stat_dir / "replicate_level_statistical_suite.json", "w") as f:
+            json.dump(replicate_suite, f, indent=2)
+    return replicate_suite
+
+
+def sync_checkpoint_reports_to_master_tables(
+    prop_json: Path,
+    b1_json: Path,
+    b2_json: Path,
+    fasta_path: str,
+    pred_newick_path: str,
+    stressor_gt_path: str,
+    out_reports_root: str,
+    agent_model: str,
+    zeroshot_model: str,
+    generic_agent_model: str,
+    allowed_dataset_ids: set[str] | None = None,
+) -> dict:
+    """Upserts already-existing Stage B report JSON checkpoints into master TSV and replicate suite."""
+    prop_rep = json.loads(prop_json.read_text())
+    b1_rep = json.loads(b1_json.read_text())
+    b2_rep = json.loads(b2_json.read_text())
+
+    rows = [
+        _extract_summary_row(
+            "Proposed_4State_Agent",
+            agent_model,
+            prop_rep,
+            str(prop_json),
+            fasta_path,
+            pred_newick_path,
+            stressor_gt_path,
+        ),
+        _extract_summary_row(
+            "Baseline1_ZeroShot_LLM",
+            zeroshot_model,
+            b1_rep,
+            str(b1_json),
+            fasta_path,
+            pred_newick_path,
+            stressor_gt_path,
+        ),
+        _extract_summary_row(
+            "Baseline2_Generic_Agent",
+            generic_agent_model,
+            b2_rep,
+            str(b2_json),
+            fasta_path,
+            pred_newick_path,
+            stressor_gt_path,
+        ),
+    ]
+    stat_dir = Path(out_reports_root) / "statistical_comparisons"
+    stat_dir.mkdir(parents=True, exist_ok=True)
+    master_df = _upsert_master_tsv(stat_dir / "master_benchmark_metrics_table.tsv", rows)
+    current_is_mock = "OFFLINE_DETERMINISTIC_MOCK" in str(rows[0]["llm_model_id"])
+    return _recompute_replicate_suite_from_master(
+        master_df=master_df,
+        stat_dir=stat_dir,
+        current_is_mock=current_is_mock,
+        agent_model=agent_model,
+        zeroshot_model=zeroshot_model,
+        generic_agent_model=generic_agent_model,
+        allowed_dataset_ids=allowed_dataset_ids,
+    )
+
+
+def _collect_pooled_node_binaries(
+    prop_rows: list[dict], base_rows: list[dict]
+) -> tuple[tuple[list[int], list[int]], tuple[list[int], list[int]]]:
+    """Loads paired per-node binary CCVR and BSF vectors across matched report JSON files."""
+    p_ccvr, b_ccvr = [], []
+    p_bsf, b_bsf = [], []
+    for pr, br in zip(prop_rows, base_rows):
+        p_path = Path(str(pr.get("report_json_path", "")))
+        b_path = Path(str(br.get("report_json_path", "")))
+        if not (p_path.exists() and b_path.exists()):
+            continue
+        try:
+            p_doc = json.loads(p_path.read_text())
+            b_doc = json.loads(b_path.read_text())
+            p_nodes = {n["node_id"]: n for n in p_doc.get("node_audits", [])}
+            b_nodes = {n["node_id"]: n for n in b_doc.get("node_audits", [])}
+            shared_ids = sorted(set(p_nodes.keys()) & set(b_nodes.keys()))
+            for nid in shared_ids:
+                p_eq = p_nodes[nid]["explanation_quality_vector"]
+                b_eq = b_nodes[nid]["explanation_quality_vector"]
+                p_ccvr.append(1 if float(p_eq["ccvr_local"]) >= 0.999 else 0)
+                b_ccvr.append(1 if float(b_eq["ccvr_local"]) >= 0.999 else 0)
+                p_bsf.append(int(p_eq["bsf_local"]))
+                b_bsf.append(int(b_eq["bsf_local"]))
+        except Exception:
+            continue
+    return (p_ccvr, b_ccvr), (p_bsf, b_bsf)
 
 
 def run_three_way_comparison(
@@ -169,6 +385,7 @@ def run_three_way_comparison(
     lm_studio_base_url: str | None = None,
     require_live_llm: bool = False,
     allow_offline_mock: bool = False,
+    allowed_dataset_ids: set[str] | None = None,
 ) -> dict:
     """
     Runs Proposed 4-State Agent, AI Baseline 1 (Zero-Shot LLM), and AI Baseline 2 (Generic Agent)
@@ -307,31 +524,16 @@ def run_three_way_comparison(
 
     tsv_path = stat_dir / "master_benchmark_metrics_table.tsv"
     master_df = _upsert_master_tsv(tsv_path, rows)
-
-    # Compute replicate-level statistical suite across all paired datasets in master_df (>= 2 replicates)
-    replicate_suite = {}
-    prop_all = master_df[master_df["auditor_method"] == "Proposed_4State_Agent"].sort_values(
-        ["dataset_id", "target_model"]
+    current_is_mock = "OFFLINE_DETERMINISTIC_MOCK" in str(rows[0]["llm_model_id"])
+    replicate_suite = _recompute_replicate_suite_from_master(
+        master_df=master_df,
+        stat_dir=stat_dir,
+        current_is_mock=current_is_mock,
+        agent_model=agent_model,
+        zeroshot_model=zeroshot_model,
+        generic_agent_model=generic_agent_model,
+        allowed_dataset_ids=allowed_dataset_ids,
     )
-    b1_all = master_df[master_df["auditor_method"] == "Baseline1_ZeroShot_LLM"].sort_values(
-        ["dataset_id", "target_model"]
-    )
-    b2_all = master_df[master_df["auditor_method"] == "Baseline2_Generic_Agent"].sort_values(
-        ["dataset_id", "target_model"]
-    )
-    if len(prop_all) >= 2 and len(prop_all) == len(b1_all) == len(b2_all):
-        replicate_suite = {
-            "vs_baseline1_zeroshot_across_replicates": run_replicate_statistical_suite(
-                prop_all.to_dict(orient="records"),
-                b1_all.to_dict(orient="records"),
-            ),
-            "vs_baseline2_generic_across_replicates": run_replicate_statistical_suite(
-                prop_all.to_dict(orient="records"),
-                b2_all.to_dict(orient="records"),
-            ),
-        }
-        with open(stat_dir / "replicate_level_statistical_suite.json", "w") as f:
-            json.dump(replicate_suite, f, indent=2)
 
     comparison_summary = {
         "dataset_id": dataset_id,

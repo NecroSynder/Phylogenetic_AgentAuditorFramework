@@ -47,7 +47,7 @@ from src.schemas.audit_schema import (
     NodeAuditRecord,
 )
 from src.tools.bio_tools import (
-    diagnose_evolutionary_stressor,
+    audit_tree_topology,
     extract_prose_coordinate_claims,
     verify_claim_coordinates,
 )
@@ -141,31 +141,35 @@ def compute_feature_precision_recall_f1(
 def _detect_confidence_tiers_in_text(text: str) -> tuple[bool, bool, bool]:
     """Negation-aware detection of High, Moderate, and Low confidence descriptors in prose."""
     text_lower = text.lower()
-    # Strip negated descriptors (e.g., 'does not have high support', 'not high confidence', 'lacks strong support')
+    qual = r"(?:(?:bootstrap|model|clade|resampled|node)\s+)?"
+    # Strip negated descriptors (e.g., 'does not have high support', 'not high bootstrap support', 'lacks strong support')
     cleaned = re.sub(
         r"\b(?:not|no|never|without|lacks?|neither|non-)(?:\s+\w+){0,2}\s+"
-        r"(?:definitive(?:\s+high)?|high[- ]confidence|high[- ]support|strong[- ]support|"
-        r"moderate[- ]confidence|moderate[- ]support|moderate|"
-        r"low[- ]confidence|low[- ]support|weak[- ]support|poor[- ]support|weak\s+split)\b",
+        rf"(?:definitive(?:\s+high)?(?:\s+{qual}(?:confidence|support))?|"
+        rf"high[- ](?:{qual})?(?:confidence|support)|strong[- ](?:{qual})?(?:confidence|support)|"
+        rf"moderate[- ](?:{qual})?(?:confidence|support)|moderate|"
+        rf"low[- ](?:{qual})?(?:confidence|support)|weak[- ](?:{qual})?(?:confidence|support)|"
+        rf"poor[- ](?:{qual})?(?:confidence|support)|weak\s+split)\b",
         " ",
         text_lower,
     )
 
     has_high = bool(
         re.search(
-            r"\b(?:definitive(?:\s+high)?|high[- ]confidence|high[- ]support|strong[- ]support)\b",
+            rf"\b(?:definitive(?:\s+high)?|high[- ](?:{qual})?(?:confidence|support)|strong[- ](?:{qual})?(?:confidence|support))\b",
             cleaned,
         )
     )
     has_moderate = bool(
         re.search(
-            r"\b(?:moderate[- ]confidence|moderate[- ]support|moderate)\b",
+            rf"\b(?:moderate[- ](?:{qual})?(?:confidence|support)|moderate)\b",
             cleaned,
         )
     )
     has_low = bool(
         re.search(
-            r"\b(?:low[- ]confidence|low[- ]support|weak[- ]support|poor[- ]support|weak\s+split)\b",
+            rf"\b(?:low[- ](?:{qual})?(?:confidence|support)|weak[- ](?:{qual})?(?:confidence|support)|"
+            rf"poor[- ](?:{qual})?(?:confidence|support)|weak\s+split)\b",
             cleaned,
         )
     )
@@ -303,11 +307,26 @@ def compute_fgs_local(
                     "homoplas",
                     "indel",
                     "support",
+                    "bootstrap",
                     "confidence",
+                    "posterior",
                     "reference tree",
                     "window",
                     "entropy",
                     "gap",
+                    "site",
+                    "coordinate",
+                    "position",
+                    "column",
+                    "mutation",
+                    "substitution",
+                    "clade",
+                    "split",
+                    "branch",
+                    "taxa",
+                    "stressor",
+                    "lba",
+                    "recombination",
                     valid_artifact.lower(),
                 )
             )
@@ -595,6 +614,50 @@ def compute_edr(flagged_anomalies: set[str], true_anomalies: set[str]) -> float:
     return round(len(flagged_anomalies & true_anomalies) / len(true_anomalies), 4)
 
 
+def _clade_enriched_in_recomb_intervals(
+    clade_taxa: list[str],
+    fasta_path: str,
+    recomb_intervals: list,
+    causal_evidence: list[dict] | None = None,
+) -> bool:
+    """Checks directly from raw alignment & recomb_intervals (without Tool 3) if a clade reflects recombination."""
+    if not recomb_intervals:
+        return False
+    taxa_ids, char_mat, seq_len = load_alignment_data(fasta_path)
+    if seq_len <= 0:
+        return False
+
+    recomb_mask = np.zeros(seq_len, dtype=bool)
+    for c0, c1 in recomb_intervals:
+        recomb_mask[max(0, int(c0) - 1) : min(seq_len, int(c1))] = True
+    if not np.any(recomb_mask) or not np.any(~recomb_mask):
+        return False
+
+    if causal_evidence:
+        in_hits = sum(
+            1
+            for m in causal_evidence
+            if any(
+                int(c0) <= int(m.get("site_coordinate", m.get("site", -1))) <= int(c1)
+                for c0, c1 in recomb_intervals
+            )
+        )
+        f_recomb = float(np.mean(recomb_mask))
+        min_frac = max(0.20, min(0.75, f_recomb * 2.0))
+        if len(causal_evidence) > 0 and (in_hits / len(causal_evidence)) >= min_frac and in_hits >= 1:
+            return True
+
+    clade_set = set(clade_taxa)
+    in_indices = np.flatnonzero(np.array([tid in clade_set for tid in taxa_ids], dtype=bool))
+    if len(in_indices) >= 2:
+        r0, r1 = int(in_indices[0]), int(in_indices[-1])
+        sim_in = float(np.mean(char_mat[r0, recomb_mask] == char_mat[r1, recomb_mask]))
+        sim_out = float(np.mean(char_mat[r0, ~recomb_mask] == char_mat[r1, ~recomb_mask]))
+        if sim_in > (sim_out + 0.04):
+            return True
+    return False
+
+
 def compute_report_edr(
     node_audits: list[dict],
     fasta_path: str,
@@ -602,41 +665,158 @@ def compute_report_edr(
     stressor_gt_path: str,
 ) -> float:
     """
-    Evaluates Agent-Audited Error Detection Rate (Eq. 4.4) strictly against deterministic
-    ground-truth stressor diagnoses on discordant splits (eliminating self-referential EDR bias).
+    Evaluates Agent-Audited Error Detection Rate (PDF Eq. 1, p. 8):
+        EDR = |A_flagged intersect A_true| / |A_true|
+    strictly against independent ground-truth annotations in A_true.json
+    (documented_clade_anomalies, expected_stressors, long_branch_taxa, recombination_breakpoints,
+    gap_tracts, and min_internal_branch_length) WITHOUT calling Tool 3 (diagnose_evolutionary_stressor).
     """
+    disc_nodes = [r for r in node_audits if r["topological_status"] != "CONCORDANT"]
+    if not disc_nodes:
+        false_concordant_alarms = any(
+            r.get("diagnosed_failure_mode", {}).get("primary_stressor", "NONE") != "NONE"
+            for r in node_audits
+        )
+        return 0.0 if false_concordant_alarms else 1.0
+
+    a_true = load_json_dict(stressor_gt_path)
+    long_taxa = set(a_true.get("long_branch_taxa") or [])
+    recomb_bps = a_true.get("recombination_breakpoints") or []
+    gapped_pct = float(
+        a_true.get("gapped_column_pct", a_true.get("mean_gap_density_pct", 0.0))
+    )
+    min_int = float(a_true.get("min_internal_branch_length", 0.05))
+    mean_inf_ci = float(
+        a_true.get("mean_informative_ci", a_true.get("mean_alignment_ci", 1.0))
+    )
+
     true_anomalies: set[str] = set()
     flagged_anomalies: set[str] = set()
 
-    for rec in node_audits:
-        if rec["topological_status"] == "CONCORDANT":
+    # 1. Explicit wet-lab / literature clade-scoped anomaly annotations (if present in A_true.json)
+    for idx, doc_item in enumerate(a_true.get("documented_clade_anomalies") or []):
+        doc_taxa = set(doc_item.get("clade_taxa") or [])
+        doc_stressor = str(doc_item.get("stressor", "")).strip()
+        if not doc_taxa or not doc_stressor:
             continue
-        nid = rec["node_id"]
-        gt_diag = diagnose_evolutionary_stressor(
-            fasta_path=fasta_path,
-            pred_newick_path=pred_newick_path,
-            node_id=nid,
-            stressor_gt_path=stressor_gt_path,
-        )
-        gt_stressor = gt_diag["primary_artifact"]
-        pred_stressor = rec["diagnosed_failure_mode"]["primary_stressor"]
-
-        if gt_stressor != "NONE":
-            true_anomalies.add(f"{nid}:{gt_stressor}")
-            if pred_stressor == gt_stressor or (
-                gt_stressor == "SHORT_BRANCH_HOMOPLASY_AND_LBA"
-                and pred_stressor in ("LBA", "SHORT_BRANCH_HOMOPLASY")
+        matching_disc = [
+            r
+            for r in disc_nodes
+            if set(r["predicted_clade_taxa"]) == doc_taxa
+            or len(set(r["predicted_clade_taxa"]) & doc_taxa) >= min(2, len(doc_taxa))
+        ]
+        if matching_disc:
+            anom_key = f"DOC_CLADE_{idx}:{doc_stressor}"
+            true_anomalies.add(anom_key)
+            if any(
+                r["diagnosed_failure_mode"]["primary_stressor"] == doc_stressor
+                for r in matching_disc
             ):
-                # Exact match required; partial credit NOT added to set unless exact tag matches
-                if pred_stressor == gt_stressor:
-                    flagged_anomalies.add(f"{nid}:{gt_stressor}")
-        else:
-            # Topological error with unstructured noise: auditor must flag discordant status without inventing wrong stressor
-            true_anomalies.add(f"{nid}:DISCORDANT")
-            if pred_stressor == "NONE":
-                flagged_anomalies.add(f"{nid}:DISCORDANT")
+                flagged_anomalies.add(anom_key)
 
-    return compute_edr(flagged_anomalies, true_anomalies)
+    # 2. Dataset-level ground-truth stressors active across discordant splits in T_pred
+    all_disc_taxa = set().union(*(set(r["predicted_clade_taxa"]) for r in disc_nodes))
+    all_pred_stressors = {
+        r["diagnosed_failure_mode"]["primary_stressor"] for r in disc_nodes
+    }
+    expected_list = list(a_true.get("expected_stressors") or [])
+    expected_set = set(expected_list)
+
+    for gt_st in expected_list:
+        if gt_st in ("LBA", "SHORT_BRANCH_HOMOPLASY_AND_LBA"):
+            if (not long_taxa) or bool(all_disc_taxa & long_taxa):
+                anom_key = f"GT:{gt_st}"
+                true_anomalies.add(anom_key)
+                lba_disc = [
+                    r
+                    for r in disc_nodes
+                    if (not long_taxa)
+                    or bool(set(r["predicted_clade_taxa"]) & long_taxa)
+                ]
+                lba_preds = {
+                    r["diagnosed_failure_mode"]["primary_stressor"] for r in lba_disc
+                }
+                if gt_st == "LBA":
+                    # Accept either LBA or compound SHORT_BRANCH_HOMOPLASY_AND_LBA on the LBA clade
+                    if lba_preds & {"LBA", "SHORT_BRANCH_HOMOPLASY_AND_LBA"}:
+                        flagged_anomalies.add(anom_key)
+                elif "SHORT_BRANCH_HOMOPLASY_AND_LBA" in lba_preds or (
+                    "LBA" in lba_preds
+                    and ("SHORT_BRANCH_HOMOPLASY" in all_pred_stressors or min_int < 0.005)
+                ):
+                    flagged_anomalies.add(anom_key)
+
+        elif gt_st == "RECOMBINATION" and recomb_bps:
+            recomb_disc = [
+                r
+                for r in disc_nodes
+                if _clade_enriched_in_recomb_intervals(
+                    r["predicted_clade_taxa"],
+                    fasta_path,
+                    recomb_bps,
+                    r.get("causal_sequence_evidence"),
+                )
+            ]
+            if recomb_disc:
+                anom_key = "GT:RECOMBINATION"
+                true_anomalies.add(anom_key)
+                if any(
+                    r["diagnosed_failure_mode"]["primary_stressor"] == "RECOMBINATION"
+                    for r in recomb_disc
+                ):
+                    flagged_anomalies.add(anom_key)
+
+        elif gt_st == "INDEL_GAP" and gapped_pct >= 8.0:
+            anom_key = "GT:INDEL_GAP"
+            true_anomalies.add(anom_key)
+            if "INDEL_GAP" in all_pred_stressors:
+                flagged_anomalies.add(anom_key)
+
+        elif gt_st == "SHORT_BRANCH_HOMOPLASY" and (min_int < 0.005 or mean_inf_ci < 0.65):
+            anom_key = "GT:SHORT_BRANCH_HOMOPLASY"
+            true_anomalies.add(anom_key)
+            if all_pred_stressors & {
+                "SHORT_BRANCH_HOMOPLASY",
+                "SHORT_BRANCH_HOMOPLASY_AND_LBA",
+            }:
+                flagged_anomalies.add(anom_key)
+
+    # 3. Fallback when discordant splits occur outside cataloged LBA/recomb/indel tracts
+    if not true_anomalies:
+        if min_int < 0.005 or mean_inf_ci < 0.65:
+            true_anomalies.add("GT:SHORT_BRANCH_HOMOPLASY")
+            if all_pred_stressors & {"SHORT_BRANCH_HOMOPLASY", "SHORT_BRANCH_HOMOPLASY_AND_LBA"}:
+                flagged_anomalies.add("GT:SHORT_BRANCH_HOMOPLASY")
+        else:
+            true_anomalies.add("GT:DISCORDANT")
+            if "NONE" in all_pred_stressors:
+                flagged_anomalies.add("GT:DISCORDANT")
+
+    # 4. Penalize fabricated stressor classes completely absent from A_true ground truth
+    fabricated: set[str] = set()
+    if (
+        not long_taxa
+        and not (expected_set & {"LBA", "SHORT_BRANCH_HOMOPLASY_AND_LBA"})
+        and (all_pred_stressors & {"LBA", "SHORT_BRANCH_HOMOPLASY_AND_LBA"})
+    ):
+        fabricated.add("FAB:LBA")
+    if (
+        not recomb_bps
+        and ("RECOMBINATION" not in expected_set)
+        and ("RECOMBINATION" in all_pred_stressors)
+    ):
+        fabricated.add("FAB:RECOMBINATION")
+    if (
+        gapped_pct < 5.0
+        and ("INDEL_GAP" not in expected_set)
+        and ("INDEL_GAP" in all_pred_stressors)
+    ):
+        fabricated.add("FAB:INDEL_GAP")
+
+    if not true_anomalies:
+        return 1.0
+    denom = len(true_anomalies) + len(fabricated)
+    return round(len(flagged_anomalies & true_anomalies) / denom, 4)
 
 
 # ==============================================================================
@@ -845,22 +1025,47 @@ def run_statistical_validation(
     }
 
 
+def _mcnemar_from_binary_arrays(a_bin: np.ndarray, b_bin: np.ndarray) -> tuple[float, float]:
+    n11 = int(np.sum((a_bin == 1) & (b_bin == 1)))
+    n10 = int(np.sum((a_bin == 1) & (b_bin == 0)))
+    n01 = int(np.sum((a_bin == 0) & (b_bin == 1)))
+    n00 = int(np.sum((a_bin == 0) & (b_bin == 0)))
+    if n10 + n01 == 0:
+        return 0.0, 1.0
+    res_m = mcnemar([[n11, n10], [n01, n00]], exact=(n10 + n01 < 25))
+    return float(res_m.statistic), float(res_m.pvalue)
+
+
 def run_replicate_statistical_suite(
     proposed_rows: list[dict],
     baseline_rows: list[dict],
     alpha: float = 0.05,
+    pooled_node_ccvr: tuple[list[int], list[int]] | None = None,
+    pooled_node_bsf: tuple[list[int], list[int]] | None = None,
 ) -> dict:
     """
-    Runs paired replicate-level hypothesis tests across multiple independent benchmark datasets
-    (Manuscript Section 4.3.1):
-      - Paired Wilcoxon signed-rank across replicates for G_tree, Mean_F1, Mean_FGS, LCR, EDR
-      - McNemar's test on replicate-level full coordinate verification (CCVR == 1.0)
-      - Family-wise Benjamini-Hochberg FDR correction across all tested metrics.
+    Runs paired replicate-level & pooled binary hypothesis tests across independent benchmark datasets
+    (PDF Section 6.3.1, p. 8):
+      - Paired two-sided Wilcoxon signed-rank across replicates for continuous metrics:
+        G_tree, Mean_G_node, Mean_F1, Mean_IG, Mean_FGS, LCR, EDR
+      - McNemar's test on binary proportions (CCVR and BSF) at both replicate level and pooled node level
+      - Family-wise Benjamini-Hochberg FDR correction across all tested metrics at alpha = 0.05.
     """
     if len(proposed_rows) != len(baseline_rows) or not proposed_rows:
         return {}
 
-    continuous_keys = ["g_tree", "mean_feature_f1", "mean_fgs", "lcr", "edr"]
+    candidate_continuous = [
+        "g_tree",
+        "mean_g_node",
+        "mean_feature_f1",
+        "mean_ig",
+        "mean_fgs",
+        "lcr",
+        "edr",
+    ]
+    continuous_keys = [
+        k for k in candidate_continuous if (k in proposed_rows[0] and k in baseline_rows[0])
+    ]
     raw_pvals: list[float] = []
     metric_names: list[str] = []
     stats_map: dict[str, float] = {}
@@ -879,18 +1084,36 @@ def run_replicate_statistical_suite(
 
     a_ccvr_bin = np.array([1 if float(r["ccvr"]) >= 0.999 else 0 for r in proposed_rows], dtype=int)
     b_ccvr_bin = np.array([1 if float(r["ccvr"]) >= 0.999 else 0 for r in baseline_rows], dtype=int)
-    n11 = int(np.sum((a_ccvr_bin == 1) & (b_ccvr_bin == 1)))
-    n10 = int(np.sum((a_ccvr_bin == 1) & (b_ccvr_bin == 0)))
-    n01 = int(np.sum((a_ccvr_bin == 0) & (b_ccvr_bin == 1)))
-    n00 = int(np.sum((a_ccvr_bin == 0) & (b_ccvr_bin == 0)))
-    if n10 + n01 == 0:
-        m_stat, m_pval = 0.0, 1.0
-    else:
-        res_m = mcnemar([[n11, n10], [n01, n00]], exact=(n10 + n01 < 25))
-        m_stat, m_pval = float(res_m.statistic), float(res_m.pvalue)
+    m_stat, m_pval = _mcnemar_from_binary_arrays(a_ccvr_bin, b_ccvr_bin)
     metric_names.append("mcnemar_ccvr_perfect")
     stats_map["mcnemar_ccvr_perfect"] = round(m_stat, 4)
     raw_pvals.append(m_pval)
+
+    if "bsf" in proposed_rows[0] and "bsf" in baseline_rows[0]:
+        a_bsf_bin = np.array([1 if float(r["bsf"]) >= 0.999 else 0 for r in proposed_rows], dtype=int)
+        b_bsf_bin = np.array([1 if float(r["bsf"]) >= 0.999 else 0 for r in baseline_rows], dtype=int)
+        mb_stat, mb_pval = _mcnemar_from_binary_arrays(a_bsf_bin, b_bsf_bin)
+        metric_names.append("mcnemar_bsf_perfect")
+        stats_map["mcnemar_bsf_perfect"] = round(mb_stat, 4)
+        raw_pvals.append(mb_pval)
+
+    if pooled_node_ccvr and len(pooled_node_ccvr[0]) == len(pooled_node_ccvr[1]) and len(pooled_node_ccvr[0]) > 0:
+        pc_stat, pc_pval = _mcnemar_from_binary_arrays(
+            np.asarray(pooled_node_ccvr[0], dtype=int),
+            np.asarray(pooled_node_ccvr[1], dtype=int),
+        )
+        metric_names.append("mcnemar_ccvr_pooled_nodes")
+        stats_map["mcnemar_ccvr_pooled_nodes"] = round(pc_stat, 4)
+        raw_pvals.append(pc_pval)
+
+    if pooled_node_bsf and len(pooled_node_bsf[0]) == len(pooled_node_bsf[1]) and len(pooled_node_bsf[0]) > 0:
+        pb_stat, pb_pval = _mcnemar_from_binary_arrays(
+            np.asarray(pooled_node_bsf[0], dtype=int),
+            np.asarray(pooled_node_bsf[1], dtype=int),
+        )
+        metric_names.append("mcnemar_bsf_pooled_nodes")
+        stats_map["mcnemar_bsf_pooled_nodes"] = round(pb_stat, 4)
+        raw_pvals.append(pb_pval)
 
     reject, p_fdr, _, _ = multipletests(raw_pvals, alpha=alpha, method="fdr_bh")
     out: dict[str, Any] = {"n_replicates": len(proposed_rows)}
@@ -902,3 +1125,105 @@ def run_replicate_statistical_suite(
             "significant": bool(reject[idx]),
         }
     return out
+
+
+def evaluate_stage_a_model_row(
+    dataset_id: str,
+    target_model: str,
+    pred_newick_path: str,
+    true_newick_path: str,
+    pred_meta_path: str | None = None,
+    stressor_gt_path: str | None = None,
+    support_threshold: float = 85.0,
+) -> dict:
+    """Computes Stage A topological & false-confidence metrics (RF_norm, FCI_global, FCI_cond) for a standardized tree."""
+    topo = audit_tree_topology(
+        pred_newick_path=pred_newick_path,
+        true_newick_path=true_newick_path,
+        pred_meta_path=pred_meta_path,
+        support_threshold=support_threshold,
+        stressor_gt_path=stressor_gt_path,
+    )
+    return {
+        "dataset_id": dataset_id,
+        "target_model": target_model,
+        "rf_norm": float(topo["normalized_rf_distance"]),
+        "fci_global": float(topo["fci_global"]),
+        "fci_conditional": float(topo["fci_conditional"]),
+        "total_internal_nodes": int(topo["total_internal_nodes"]),
+        "false_confidence_nodes_count": int(topo["false_confidence_nodes_count"]),
+        "pred_newick_path": str(pred_newick_path),
+    }
+
+
+def run_stage_a_statistical_suite(
+    stage_a_rows: list[dict],
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Executes Stage A paired two-sided Wilcoxon signed-rank tests with Benjamini-Hochberg FDR correction
+    comparing Neural Target Models (Fusang, Phyloformer) against Classical ML References
+    (IQ-TREE2, RAxML-NG, FastTree2) on RF_norm, FCI_global, and FCI_conditional (PDF Section 6.3.1, p. 8).
+    """
+    by_model_ds: dict[str, dict[str, dict]] = {}
+    for row in stage_a_rows:
+        by_model_ds.setdefault(str(row["target_model"]), {})[str(row["dataset_id"])] = row
+
+    neural_models = ["Fusang", "Phyloformer"]
+    ml_references = ["IQ-TREE2", "RAxML-NG", "FastTree2"]
+    metrics_to_test = ["rf_norm", "fci_global", "fci_conditional"]
+
+    suite: dict[str, Any] = {}
+    for n_mod in neural_models:
+        if n_mod not in by_model_ds:
+            continue
+        n_map = by_model_ds[n_mod]
+        pair_records = []
+        raw_pvals = []
+
+        for ml_mod in ml_references:
+            if ml_mod not in by_model_ds:
+                continue
+            ml_map = by_model_ds[ml_mod]
+            shared_ds = sorted(set(n_map.keys()) & set(ml_map.keys()))
+            if len(shared_ds) < 2:
+                continue
+            for m_key in metrics_to_test:
+                a_vec = np.array([float(n_map[d][m_key]) for d in shared_ds], dtype=float)
+                b_vec = np.array([float(ml_map[d][m_key]) for d in shared_ds], dtype=float)
+                if np.allclose(a_vec - b_vec, 0.0):
+                    w_stat, p_val = 0.0, 1.0
+                else:
+                    res = wilcoxon(a_vec, b_vec, zero_method="zsplit", alternative="two-sided")
+                    w_stat, p_val = float(res.statistic), float(res.pvalue)
+                pair_records.append(
+                    {
+                        "comparison": f"{n_mod}_vs_{ml_mod}",
+                        "metric": m_key,
+                        "n_paired_datasets": len(shared_ds),
+                        "neural_mean": round(float(np.mean(a_vec)), 4),
+                        "ml_mean": round(float(np.mean(b_vec)), 4),
+                        "statistic": round(w_stat, 4),
+                        "p_raw": p_val,
+                    }
+                )
+                raw_pvals.append(p_val)
+
+        if pair_records:
+            reject, p_fdr, _, _ = multipletests(raw_pvals, alpha=alpha, method="fdr_bh")
+            mod_summary: dict[str, Any] = {}
+            for rec, p_adj, sig in zip(pair_records, p_fdr, reject):
+                comp_key = rec["comparison"]
+                mod_summary.setdefault(comp_key, {"n_paired_datasets": rec["n_paired_datasets"]})[
+                    f"wilcoxon_{rec['metric']}"
+                ] = {
+                    "neural_mean": rec["neural_mean"],
+                    "ml_mean": rec["ml_mean"],
+                    "statistic": rec["statistic"],
+                    "p_raw": round(float(rec["p_raw"]), 6),
+                    "p_fdr_bh": round(float(p_adj), 6),
+                    "significant": bool(sig),
+                }
+            suite[n_mod] = mod_summary
+
+    return suite

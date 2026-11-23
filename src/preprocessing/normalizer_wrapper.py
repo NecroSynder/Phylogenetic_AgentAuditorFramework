@@ -58,9 +58,33 @@ def generate_bootstrap_replicates(
     rep_dir.mkdir(parents=True, exist_ok=True)
     rep_paths = []
 
+    ambig_set = {"-", "?", "N", "X"}
+    orig_non_ambig_cols_by_row = [
+        np.flatnonzero(~np.isin(char_matrix[r_i], list(ambig_set)))
+        for r_i in range(len(taxa_ids))
+    ]
+
     for b in range(b_replicates):
         col_indices = rng.integers(0, seq_len, size=seq_len)
-        resampled_mat = char_matrix[:, col_indices]
+        for _ in range(10):
+            resampled_probe = char_matrix[:, col_indices]
+            has_empty_row = any(
+                orig_non_ambig_cols_by_row[r_i].size > 0
+                and np.all(np.isin(resampled_probe[r_i], list(ambig_set)))
+                for r_i in range(len(taxa_ids))
+            )
+            if not has_empty_row:
+                break
+            col_indices = rng.integers(0, seq_len, size=seq_len)
+
+        resampled_mat = char_matrix[:, col_indices].copy()
+        # Deterministic safeguard for ultra-sparse empirical sequences so raxml-ng never sees a 100%-gap taxon
+        for r_i, valid_cols in enumerate(orig_non_ambig_cols_by_row):
+            if valid_cols.size > 0 and np.all(np.isin(resampled_mat[r_i], list(ambig_set))):
+                chosen_col = int(valid_cols[int(rng.integers(0, valid_cols.size))])
+                col_indices[r_i % seq_len] = chosen_col
+                resampled_mat = char_matrix[:, col_indices]
+
         records = [
             SeqRecord(Seq("".join(resampled_mat[idx])), id=taxa_ids[idx], description="")
             for idx in range(len(taxa_ids))
@@ -191,12 +215,20 @@ def standardize_and_root_tree(
     Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
     taxa = dendropy.TaxonNamespace()
     primary_dp = dendropy.Tree.get(
-        data=primary_newick_str, schema="newick", taxon_namespace=taxa
+        data=primary_newick_str,
+        schema="newick",
+        taxon_namespace=taxa,
+        preserve_underscores=True,
     )
     boot_trees = dendropy.TreeList(taxon_namespace=taxa)
     for b_str in bootstrap_newick_strs:
         boot_trees.append(
-            dendropy.Tree.get(data=b_str, schema="newick", taxon_namespace=taxa)
+            dendropy.Tree.get(
+                data=b_str,
+                schema="newick",
+                taxon_namespace=taxa,
+                preserve_underscores=True,
+            )
         )
 
     split_dist = boot_trees.split_distribution(is_bipartitions_updated=False)
@@ -209,8 +241,14 @@ def standardize_and_root_tree(
         bitmask = dp_node.edge.bipartition.split_bitmask
         dp_node.label = f"{split_freqs.get(bitmask, 0.0):.4f}"
 
-    dp_newick = primary_dp.as_string(schema="newick", suppress_rooting=True).strip()
+    dp_newick = primary_dp.as_string(
+        schema="newick",
+        suppress_rooting=True,
+        unquoted_underscores=True,
+    ).strip()
     ete_tree = Tree(dp_newick, format=0)
+    for lf in ete_tree.iter_leaves():
+        lf.name = lf.name.strip("'\"")
     ete_tree.set_outgroup(ete_tree & outgroup_taxon)
 
     branch_lengths_present = target_model != "Fusang"

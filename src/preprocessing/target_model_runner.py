@@ -28,7 +28,10 @@ from pathlib import Path
 import numpy as np
 from ete3 import Tree
 
-from src.preprocessing.ground_truth_gen import detect_sequence_alphabet
+from src.preprocessing.ground_truth_gen import (
+    detect_sequence_alphabet,
+    parse_iqtree_best_model,
+)
 from src.preprocessing.normalizer_wrapper import (
     distance_matrix_to_bionj_newick,
     generate_bootstrap_replicates,
@@ -198,9 +201,44 @@ def save_distance_matrix_tsv(
             f.write(f"{tid}\t{row_vals}\n")
 
 
-def _infer_single_classical_worker(args: tuple[str, str, bool, int]) -> str:
+def _select_iqtree_best_model_once(fasta_path: str, is_dna: bool, seed: int) -> str:
+    """Runs IQ-TREE 2 ModelFinder (-m MFP -T 1) on the primary alignment to select best-fit model."""
+    iq_bin = resolve_conda_binary("iqtree2")
+    fallback = "GTR+G4" if is_dna else "LG+G4"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prefix = Path(tmpdir) / "mfp"
+        cmd = [
+            iq_bin,
+            "-s",
+            str(fasta_path),
+            "-m",
+            "MFP",
+            "-n",
+            "0",
+            "-nt",
+            "1",
+            "--prefix",
+            str(prefix),
+            "-seed",
+            str(seed),
+            "-quiet",
+            "-redo",
+        ]
+        try:
+            subprocess.run(
+                cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            chosen = parse_iqtree_best_model(Path(tmpdir) / "mfp.iqtree")
+            if chosen:
+                return chosen
+        except Exception:
+            pass
+    return fallback
+
+
+def _infer_single_classical_worker(args: tuple[str, str, bool, int, str | None, bool]) -> str:
     """Top-level picklable worker executing a single classical ML tree inference."""
-    fa_file, model_name, is_dna, run_seed = args
+    fa_file, model_name, is_dna, run_seed, sub_model_override, use_fast_iq = args
     if model_name == "FastTree2":
         ft_bin = resolve_conda_binary("fasttree")
         cmd = [ft_bin, "-quiet"]
@@ -216,7 +254,7 @@ def _infer_single_classical_worker(args: tuple[str, str, bool, int]) -> str:
         iq_bin = resolve_conda_binary("iqtree2")
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix = Path(tmpdir) / "iq"
-            m_str = "GTR+G4" if is_dna else "LG+G4"
+            m_str = sub_model_override or ("GTR+G4" if is_dna else "LG+G4")
             cmd = [
                 iq_bin,
                 "-s",
@@ -229,10 +267,11 @@ def _infer_single_classical_worker(args: tuple[str, str, bool, int]) -> str:
                 str(prefix),
                 "-seed",
                 str(run_seed),
-                "-fast",
                 "-quiet",
                 "-redo",
             ]
+            if use_fast_iq:
+                cmd.append("-fast")
             subprocess.run(
                 cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
@@ -272,6 +311,7 @@ def run_classical_engine_with_bootstraps(
     seq_type: str = "AUTO",
     seed: int = 42,
     max_workers: int | None = None,
+    substitution_model: str | None = None,
 ) -> tuple[str, list[str]]:
     """
     Runs IQ-TREE2, RAxML-NG, or FastTree2 across the primary MSA and B bootstrap replicate MSAs
@@ -285,8 +325,14 @@ def run_classical_engine_with_bootstraps(
     is_dna = resolved_type == "DNA"
     workers = max_workers or default_cpu_threads(8)
 
-    all_tasks = [(fasta_path, model_name, is_dna, seed)] + [
-        (rp, model_name, is_dna, seed + idx + 1) for idx, rp in enumerate(rep_paths)
+    chosen_sub_model = substitution_model
+    use_fast_iq = len(rep_paths) <= 10
+    if model_name == "IQ-TREE2" and not chosen_sub_model and len(rep_paths) > 10:
+        chosen_sub_model = _select_iqtree_best_model_once(fasta_path, is_dna, seed)
+
+    all_tasks = [(fasta_path, model_name, is_dna, seed, chosen_sub_model, use_fast_iq)] + [
+        (rp, model_name, is_dna, seed + idx + 1, chosen_sub_model, use_fast_iq)
+        for idx, rp in enumerate(rep_paths)
     ]
     if workers <= 1 or len(all_tasks) <= 2:
         results = [_infer_single_classical_worker(t) for t in all_tasks]
@@ -317,6 +363,7 @@ def run_target_model_pipeline(
     enforce_fusang_taxa_limit: bool = True,
     allow_surrogate: bool = False,
     max_workers: int | None = None,
+    substitution_model: str | None = None,
     seed: int = 42,
 ) -> dict | None:
     """
@@ -445,6 +492,7 @@ def run_target_model_pipeline(
                 seq_type=seq_type,
                 seed=seed,
                 max_workers=max_workers,
+                substitution_model=substitution_model,
             )
         else:
             raise ValueError(

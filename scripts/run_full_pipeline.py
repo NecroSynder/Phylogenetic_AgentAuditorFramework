@@ -29,7 +29,12 @@ from scripts.run_ai_baselines import run_three_way_comparison
 from src.preprocessing.empirical_consensus import build_empirical_tier3_ground_truth
 from src.preprocessing.ground_truth_gen import run_ground_truth_pipeline
 from src.preprocessing.target_model_runner import run_target_model_pipeline
-from src.utils.io_cache import load_alignment_data
+from src.utils.io_cache import (
+    DatasetPaths,
+    infer_tier_group_from_path,
+    load_alignment_data,
+    load_dataset_metadata,
+)
 
 
 def main() -> None:
@@ -81,6 +86,11 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://localhost:1234/v1", help="LM Studio server URL.")
     parser.add_argument("--require-live-llm", action="store_true", help="Require active LM Studio connection.")
     parser.add_argument(
+        "--tier-group",
+        default="auto",
+        help="Optional tier subdirectory ('tier1', 'tier2', 'tier3', '' or 'auto').",
+    )
+    parser.add_argument(
         "--offline-mock",
         action="store_true",
         help="Explicitly run deterministic offline mock synthesis without LM Studio.",
@@ -88,8 +98,18 @@ def main() -> None:
     args = parser.parse_args()
 
     b_reps = 10 if (args.quick and args.bootstraps == 100) else args.bootstraps
-    gt_dir = Path("data/02_ground_truths") / args.dataset_id
-    std_prefix = str(Path("data/03_standardized_trees") / args.dataset_id / args.target_model)
+    tier_group = (
+        infer_tier_group_from_path(args.fasta)
+        if args.tier_group == "auto"
+        else args.tier_group
+    )
+    ds_paths = DatasetPaths(
+        dataset_id=args.dataset_id,
+        target_model=args.target_model,
+        tier_group=tier_group,
+    )
+    gt_dir = ds_paths.ground_truth_dir
+    std_prefix = str(ds_paths.standardized_prefix)
     reports_root = "data/04_audit_reports"
     base_url = None if (args.base_url.lower() == "none" or args.offline_mock) else args.base_url
 
@@ -97,17 +117,23 @@ def main() -> None:
     print(f" END-TO-END PHYLOGENETIC AGENTIC AUDIT PIPELINE: {args.dataset_id} ({args.target_model})")
     print("=" * 80)
 
-    sim_meta_path = Path(args.fasta).resolve().parent / "simulation_metadata.json"
-    sim_recomb_bp = None
-    sim_expected_stressors = None
+    ds_meta = load_dataset_metadata(args.fasta)
+    sim_recomb_bp = ds_meta.get("recombination_breakpoints") or None
+    sim_expected_stressors = ds_meta.get("expected_stressors") or None
+    doc_lba_taxa = ds_meta.get("documented_lba_taxa") or ds_meta.get("lba_long_taxa") or None
+    doc_clade_anomalies = ds_meta.get("documented_clade_anomalies") or None
+    sub_model = ds_meta.get("substitution_model") or None
+    exp_anc_fa = ds_meta.get("experimental_ancestors_fasta") or None
+    if exp_anc_fa and not Path(exp_anc_fa).is_absolute():
+        cand_anc = Path(args.fasta).resolve().parent / exp_anc_fa
+        if cand_anc.exists():
+            exp_anc_fa = str(cand_anc)
+    cat_muts = ds_meta.get("cataloged_mutations") or None
+    kept_cols = ds_meta.get("kept_original_columns_1based") or None
+
     resolved_outgroup = args.outgroup
-    if sim_meta_path.exists():
-        with open(sim_meta_path) as f:
-            sim_meta = json.load(f)
-        sim_recomb_bp = sim_meta.get("recombination_breakpoints") or None
-        sim_expected_stressors = sim_meta.get("expected_stressors") or None
-        if resolved_outgroup == "Taxon_01" and sim_meta.get("outgroup_taxon"):
-            resolved_outgroup = sim_meta["outgroup_taxon"]
+    if resolved_outgroup == "Taxon_01" and ds_meta.get("outgroup_taxon"):
+        resolved_outgroup = ds_meta["outgroup_taxon"]
 
     msa_taxa_tup, _, _ = load_alignment_data(args.fasta)
     msa_taxa_sorted = sorted(msa_taxa_tup)
@@ -121,11 +147,21 @@ def main() -> None:
 
     print(f"\n[Step 1/4] Extracting Ground Truths (T_true_rooted.nwk, M_true.tsv, A_true.json) -> {gt_dir}")
     if args.true_tree.lower() == "empirical":
+        pub_tree = ds_meta.get("published_tree_path")
+        if pub_tree and not Path(pub_tree).is_absolute():
+            cand_pt = Path(args.fasta).resolve().parent / pub_tree
+            if cand_pt.exists():
+                pub_tree = str(cand_pt)
         build_empirical_tier3_ground_truth(
             fasta_path=args.fasta,
             out_dir=str(gt_dir),
             outgroup=resolved_outgroup,
             ufboot_replicates=0 if args.quick else 1000,
+            recombination_breakpoints=sim_recomb_bp,
+            published_tree_path=pub_tree,
+            expected_stressors=sim_expected_stressors,
+            documented_lba_taxa=doc_lba_taxa,
+            documented_clade_anomalies=doc_clade_anomalies,
         )
     else:
         run_ground_truth_pipeline(
@@ -135,8 +171,18 @@ def main() -> None:
             outgroup=resolved_outgroup,
             recombination_breakpoints=sim_recomb_bp,
             expected_stressors=sim_expected_stressors,
+            substitution_model=sub_model,
+            experimental_ancestors_fasta=exp_anc_fa,
+            cataloged_mutations=cat_muts,
+            kept_original_columns_1based=kept_cols,
+            documented_lba_taxa=doc_lba_taxa,
+            documented_clade_anomalies=doc_clade_anomalies,
         )
     print("           ✓ Ground truths ready.")
+
+    a_true_file = gt_dir / "A_true.json"
+    if a_true_file.exists() and not sub_model:
+        sub_model = json.loads(a_true_file.read_text()).get("substitution_model")
 
     print(f"\n[Step 2/4] Running {args.target_model} (B={b_reps} bootstraps) & Rules 1-3 Standardization...")
     std_meta = run_target_model_pipeline(
@@ -151,6 +197,7 @@ def main() -> None:
         phyloformer_batch_cmd_template=args.phyloformer_batch_cmd,
         allow_surrogate=args.use_surrogate,
         max_workers=args.workers,
+        substitution_model=sub_model,
     )
     if std_meta is None:
         print(f"[!] {args.target_model} skipped (N > 40 scaling boundary).")

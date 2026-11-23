@@ -408,7 +408,35 @@ def diagnose_evolutionary_stressor(
             sister_taxa.extend(sis.get_leaf_names())
 
     min_true_int_len = float(a_true.get("min_internal_branch_length", 0.05))
-    eff_branch_len = pred_branch_len if has_real_pred_lengths else min_true_int_len
+    local_sep_len = min_true_int_len
+    true_rooted_cand = Path(stressor_gt_path).parent / "T_true_rooted.nwk"
+    if clade_taxa and true_rooted_cand.exists():
+        try:
+            t_true = load_ete_tree(true_rooted_cand, fmt=1)
+            true_splits = get_bipartition_dict(t_true)
+            clade_frozen = frozenset(clade_taxa)
+            if clade_frozen in true_splits:
+                local_sep_len = float(true_splits[clade_frozen].dist)
+            else:
+                true_leaf_set = set(t_true.get_leaf_names())
+                valid_clade_leaves = [lf for lf in clade_taxa if lf in true_leaf_set]
+                if len(valid_clade_leaves) >= 2:
+                    mrca = t_true.get_common_ancestor(valid_clade_leaves)
+                    spanned_dists: list[float] = []
+                    for lf_name in valid_clade_leaves:
+                        cur = (t_true & lf_name).up
+                        while cur is not None and cur != mrca and not cur.is_root():
+                            spanned_dists.append(float(cur.dist))
+                            cur = cur.up
+                    resolved_spanned = [d for d in spanned_dists if d > 1e-5]
+                    if resolved_spanned:
+                        local_sep_len = float(min(resolved_spanned))
+                    elif spanned_dists:
+                        local_sep_len = float(min(spanned_dists))
+        except Exception:
+            local_sep_len = min_true_int_len
+
+    eff_branch_len = pred_branch_len if has_real_pred_lengths else local_sep_len
 
     site_metrics = a_true.get("site_metrics", {})
     clade_sites = (
@@ -437,7 +465,6 @@ def diagnose_evolutionary_stressor(
     else:
         local_ci = round(mean_inf_ci, 4)
 
-    rho_lba = float(a_true.get("global_rho_lba", 1.0))
     long_taxa = set(a_true.get("long_branch_taxa", []))
     leaf_lens = a_true.get("leaf_branch_lengths", {})
     if not long_taxa and leaf_lens:
@@ -446,14 +473,33 @@ def diagnose_evolutionary_stressor(
         long_taxa = {k for k, v in leaf_lens.items() if float(v) >= max(med * 2.5, 0.15)}
 
     clade_set = set(clade_taxa)
-    direct_multi_long_branch = len(clade_set & long_taxa) >= 2
+    direct_long_taxa = clade_set & long_taxa
+    direct_multi_long_branch = len(direct_long_taxa) >= 2
+    sister_long_taxa = set(sister_taxa) & long_taxa
     sister_repelled_long_branch = bool(
         sister_taxa
         and len(sister_taxa) <= 3
-        and (set(sister_taxa) & long_taxa)
+        and sister_long_taxa
         and local_ci < 0.75
     )
-    clade_has_long_branch = bool(clade_set & long_taxa) or sister_repelled_long_branch
+    clade_has_long_branch = bool(direct_long_taxa) or sister_repelled_long_branch
+
+    # Clade-local rho_LBA = mean(l_long) / l_internal (PDF Table 2)
+    relevant_long_taxa = direct_long_taxa if direct_long_taxa else (sister_long_taxa if sister_repelled_long_branch else set())
+    if relevant_long_taxa and leaf_lens:
+        long_vals = [float(leaf_lens[t]) for t in relevant_long_taxa if t in leaf_lens]
+        mean_long_len = float(np.mean(long_vals)) if long_vals else 0.2
+        rho_lba = round(mean_long_len / max(local_sep_len, 1e-4), 3)
+    elif relevant_long_taxa:
+        rho_lba = float(a_true.get("global_rho_lba", 1.0))
+    elif leaf_lens and clade_set:
+        all_leaf_vals = [float(v) for v in leaf_lens.values()]
+        med_leaf = float(np.median(all_leaf_vals)) if all_leaf_vals else 0.05
+        clade_leaf_vals = [float(leaf_lens[t]) for t in clade_set if t in leaf_lens]
+        mean_clade_leaf = float(np.mean(clade_leaf_vals)) if clade_leaf_vals else med_leaf
+        rho_lba = round(mean_clade_leaf / max(med_leaf, 1e-4), 3)
+    else:
+        rho_lba = float(a_true.get("global_rho_lba", 1.0))
 
     # Local gap density for clade_taxa & indel tract overlap
     taxa_ids, char_mat, seq_len = load_alignment_data(fasta_path)
@@ -511,7 +557,9 @@ def diagnose_evolutionary_stressor(
                 recomb_overlap = sim_in_blk > (sim_out_blk + 0.05)
 
     is_short_branch = eff_branch_len < 0.005
-    is_lba = rho_lba >= 5.0 and (clade_has_long_branch or local_ci < 0.65)
+    is_lba = rho_lba >= 5.0 and (
+        clade_has_long_branch or (not leaf_lens and local_ci < 0.65)
+    )
     is_indel = (
         (effective_gap_pct >= 12.0 and (has_indel_support or aln_gapped_col_pct >= 12.0))
         or (has_indel_support and aln_gapped_col_pct >= 8.0)
@@ -607,25 +655,38 @@ def inspect_alignment_window(
 
 def extract_prose_coordinate_claims(explanation_text: str) -> tuple[set[int], list[tuple[int, str, str]]]:
     """
-    Extracts all 1-based site coordinates (e.g., 'site 452', 'sites 505, 464, and 128', 'tract 10-12')
+    Extracts all 1-based site coordinates (e.g., 'site 452', 'sites 505, 464, and 128',
+    'site coordinates (88, 773, and 132)', 'positions 116, 68, 120', 'tract 10-12')
     and explicit mutation tokens (e.g., 'A452V', 'G4->C') from natural-language explanation text.
     """
     if not explanation_text:
         return set(), []
 
     prose_sites: set[int] = set()
-    # Singular 'site 452'
-    for m in re.finditer(r"\bsite\s+(\d+)\b", explanation_text, flags=re.IGNORECASE):
-        prose_sites.add(int(m.group(1)))
+    num_list_pat = r"\d+(?!\.\d|\s*%)(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+|\s*&\s*)\d+(?!\.\d|\s*%))*"
 
-    # Plural 'sites 505, 464, and 128' or 'sites (4, 128)'
+    # Direct 'site(s) / site coordinate(s) / position(s) / column(s) [such as / include] <list>'
     for m in re.finditer(
-        r"\bsites\s*\(?(\d+(?:\s*(?:,|and|&)\s*\d+)*)\)?",
+        rf"\b(?:site(?:\s+coordinate)?s?|positions?|columns?)\s*(?:is|are|include|includes|such\s+as|namely|:)?\s*\(?({num_list_pat})\)?",
         explanation_text,
         flags=re.IGNORECASE,
     ):
         for num_str in re.findall(r"\d+", m.group(1)):
             prose_sites.add(int(num_str))
+
+    # Clause-bridged phrasings such as 'Verified site coordinates from Tool 2 Output include 540, 995' or 'site coordinate ... is 205'
+    for m in re.finditer(
+        rf"\b(?:site(?:\s+coordinate)?s?|positions?|columns?)\b(?:[^.;:\d]|Tool\s+\d+){{1,60}}?\b(?:is|are|include|includes|such\s+as|namely)\s*\(?({num_list_pat})\)?",
+        explanation_text,
+        flags=re.IGNORECASE,
+    ):
+        for num_str in re.findall(r"\d+", m.group(1)):
+            prose_sites.add(int(num_str))
+
+    # Indel tract bounds 'tract 10-12'
+    for m in re.finditer(r"\btract\s+(\d+)\s*-\s*(\d+)\b", explanation_text, flags=re.IGNORECASE):
+        prose_sites.add(int(m.group(1)))
+        prose_sites.add(int(m.group(2)))
 
     # Mutation tokens such as G4C, A452V, G4->C (excluding node IDs like N12 which lack trailing state)
     prose_mutations: list[tuple[int, str, str]] = []

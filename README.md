@@ -50,10 +50,11 @@ SP_Env/
 │   ├── adapters/
 │   │   ├── run_fusang_cli.py              # Single-load batch adapter for Jerry-0591/Fusang
 │   │   └── run_phyloformer_cli.py         # Single-load batch GPU adapter for lucanest/Phyloformer
-│   ├── run_full_pipeline.py               # CLI: Master end-to-end 4-step runner
-│   ├── generate_synthetic_benchmarks.py   # CLI: Generate Tier 1 & Tier 2 DNA/AA stressor datasets
-│   ├── sanitize_tier3_fasta.py            # CLI: Clean external empirical DNA/AA FASTA files
-│   ├── prepare_empirical_tier3.py         # CLI: Build Tier 3 3-engine consensus Silver Standard
+│   ├── run_empirical_corpus.py            # CLI: Resumable Stage A + Stage B runner (N=45 datasets)
+│   ├── run_full_pipeline.py               # CLI: Master single-dataset 4-step runner
+│   ├── generate_synthetic_benchmarks.py   # CLI: Generate AliSim synthetic pre-flight test fixtures
+│   ├── sanitize_tier3_fasta.py            # CLI: Clean empirical FASTAs & remap published Newick trees
+│   ├── prepare_empirical_tier3.py         # CLI: Build 3-engine ModelFinder+UFBoot2 consensus ground truths
 │   ├── run_target_models.py               # CLI: Run Fusang, Phyloformer & classical ML baselines
 │   ├── run_live_agent_audit.py            # CLI: Run single live agent audit via LM Studio
 │   └── run_ai_baselines.py                # CLI: Run 3-way auditor comparison & statistical validation

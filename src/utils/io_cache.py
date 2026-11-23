@@ -168,6 +168,29 @@ def load_ete_tree(newick_path: str | Path, fmt: int = 1) -> Tree:
     return Tree(nwk_str, format=fmt)
 
 
+def load_dataset_metadata(fasta_path: str | Path) -> dict[str, Any]:
+    """
+    Loads per-dataset empirical or synthetic metadata if present alongside fasta_path.
+    Checks dataset_metadata.json first (empirical Tiers 1-3), then simulation_metadata.json.
+    """
+    parent = Path(fasta_path).resolve().parent
+    for fname in ("dataset_metadata.json", "simulation_metadata.json"):
+        cand = parent / fname
+        if cand.exists():
+            return dict(load_json_dict(cand))
+    return {}
+
+
+def infer_tier_group_from_path(fasta_path: str | Path) -> str:
+    """Infers canonical tier subdirectory ('tier1', 'tier2', 'tier3') from an alignment path if present."""
+    p = Path(fasta_path).resolve()
+    for part in reversed(p.parts[:-1]):
+        low = part.lower()
+        if low in {"tier1", "tier2", "tier3"}:
+            return low
+    return ""
+
+
 @dataclass(frozen=True)
 class DatasetPaths:
     """Canonical workspace directory layout for a dataset & target model."""

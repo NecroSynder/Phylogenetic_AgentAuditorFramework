@@ -17,6 +17,7 @@ import numpy as np
 from langgraph.graph import END, StateGraph
 
 from src.evaluation.metrics import (
+    VALID_STRESSOR_LABELS,
     classify_mutation_record,
     compute_lcr,
     compute_report_edr,
@@ -75,6 +76,7 @@ class DiagnosticAgentState(TypedDict, total=False):
     current_window_inspection: dict | None
     draft_claims: list[dict]
     draft_explanation: str
+    draft_stressor: str
     verification_result: dict | None
     retry_count: int
     node_committed: bool
@@ -216,12 +218,13 @@ def _extract_json_block(text: str) -> dict:
 
 def _llm_or_fallback_synthesize(
     state: DiagnosticAgentState,
-) -> tuple[list[dict], str, bool]:
+) -> tuple[list[dict], str, str, bool]:
     """
-    Executes Orchestrator synthesis (Table 4.3):
-      - Invokes custom_synthesizer if provided (supporting both single-shot and persistent test hooks).
-      - Queries live local LM Studio LLM when lm_studio_base_url is set, passing Tools 1-4 outputs
-        (including Tool 4 window inspection!) and State 4 rejection feedback on retries.
+    Executes Orchestrator synthesis (Table 4.3 & Algorithm 1):
+      - Invokes custom_synthesizer if provided (supporting 2-tuple or 3-tuple test hooks).
+      - Queries live local LM Studio LLM across initial draft + up to max_retries (retry_count <= max_retries),
+        requiring the LLM to synthesize draft_claims, primary_stressor, and explanation WITHOUT
+        silently overwriting exhausted LLM retries with a Python template.
       - Requires explicit allow_offline_mock=True when lm_studio_base_url is None, returning
         used_mock=True so offline template outputs never masquerade as live LLM runs.
     """
@@ -232,20 +235,31 @@ def _llm_or_fallback_synthesize(
     target_model = state.get("target_model", "Fusang")
     retry_count = int(state.get("retry_count", 0))
     max_retries = int(state.get("max_retries", 3))
+    is_concordant = node_info["topological_status"] == "CONCORDANT"
+    tool_stressor = (
+        "NONE"
+        if is_concordant
+        else (stressor_diag["primary_artifact"] if stressor_diag else "NONE")
+    )
 
     custom_fn = state.get("custom_synthesizer")
     if custom_fn is not None:
         if retry_count == 0 or getattr(custom_fn, "persist_across_retries", False):
-            claims, expl = custom_fn(state)
-            return claims, expl, False
+            res_custom = custom_fn(state)
+            if len(res_custom) == 3:
+                claims, expl, custom_stressor = res_custom
+            else:
+                claims, expl = res_custom
+                custom_stressor = tool_stressor
+            return claims, expl, str(custom_stressor), False
         claims, expl = _deterministic_neuro_symbolic_synthesize(
             node_info, synapomorphies, stressor_diag, window_inspection, target_model
         )
-        return claims, expl, False
+        return claims, expl, tool_stressor, False
 
     base_url = state.get("lm_studio_base_url")
     if base_url:
-        if retry_count < max_retries:
+        if retry_count <= max_retries:
             try:
                 from langchain_openai import ChatOpenAI
 
@@ -285,12 +299,15 @@ def _llm_or_fallback_synthesize(
                     "bootstrap support_pct—do not list the other rubric tiers, and even on FALSE_CONFIDENCE_ERROR "
                     "nodes state the model's bootstrap tier accurately before explaining why the split is erroneous).\n"
                     "Given the deterministic bioinformatics tool outputs below, return ONLY a valid JSON object "
-                    "with exactly two keys:\n"
+                    "with exactly three keys:\n"
                     "1. \"draft_claims\": list of objects from Tool 2 Output, each having keys:\n"
                     "   {\"site_coordinate\": <int site>, \"ancestral_state\": \"<parent_state>\", "
                     "\"derived_state\": \"<child_state>\", \"posterior_probability\": <float posterior_prob>, "
                     "\"consistency_index_ci\": <float ci_score>, \"is_indel\": <bool is_indel>}\n"
-                    "2. \"explanation\": a 1-2 sentence biological causal explanation for the split at "
+                    "2. \"primary_stressor\": one of [\"NONE\", \"LBA\", \"INDEL_GAP\", \"RECOMBINATION\", "
+                    "\"SHORT_BRANCH_HOMOPLASY\", \"SHORT_BRANCH_HOMOPLASY_AND_LBA\"] "
+                    "(use \"NONE\" if topological_status is \"CONCORDANT\", else select the primary artifact supported by Tool 3 Output).\n"
+                    "3. \"explanation\": a 1-2 sentence biological causal explanation for the split at "
                     f"node {node_info['node_id']} citing its exact bootstrap support percentage, the matching "
                     "confidence tier phrase from the rubric above, its topological status, primary stressor (if discordant), "
                     "and verified site coordinates from Tool 2 Output (never invent unverified site numbers).\n"
@@ -306,19 +323,41 @@ def _llm_or_fallback_synthesize(
                 content_str = (
                     resp.content if isinstance(resp.content, str) else str(resp.content)
                 )
-                parsed = _extract_json_block(content_str)
-                if "draft_claims" in parsed and "explanation" in parsed:
-                    return list(parsed["draft_claims"]), str(parsed["explanation"]), False
             except Exception as exc:
                 raise RuntimeError(
                     f"Live LM Studio query failed at {base_url} on node {node_info['node_id']}: {exc}"
                 ) from exc
 
-        # Exhausted max_retries on State 4 coordinate gate -> enforce strict deterministic tool grounding
-        claims, expl = _deterministic_neuro_symbolic_synthesize(
-            node_info, synapomorphies, stressor_diag, window_inspection, target_model
+            try:
+                parsed = _extract_json_block(content_str)
+                if not isinstance(parsed, dict) or "draft_claims" not in parsed or "explanation" not in parsed:
+                    raise ValueError("Missing required keys ('draft_claims', 'explanation')")
+                raw_st = str(parsed.get("primary_stressor", "NONE")).strip().upper()
+                chosen_st = raw_st if raw_st in VALID_STRESSOR_LABELS else "NONE"
+                if is_concordant:
+                    chosen_st = "NONE"
+                return list(parsed["draft_claims"]), str(parsed["explanation"]), chosen_st, False
+            except Exception as parse_exc:
+                # Malformed JSON from LLM should trigger State 4 self-correction retry (or fail CCVR cleanly on exhaustion)
+                # rather than crashing a multi-hour corpus sweep.
+                bad_claim = [
+                    {
+                        "site_coordinate": -1,
+                        "ancestral_state": "?",
+                        "derived_state": "?",
+                        "reason": f"Malformed LLM JSON output ({parse_exc})",
+                    }
+                ]
+                return bad_claim, f"Malformed JSON draft on {node_info['node_id']}.", "NONE", False
+
+        # Should never be reached since state_4 commits when retry_count == max_retries;
+        # return last LLM state without overwriting with deterministic mock.
+        return (
+            list(state.get("draft_claims", [])),
+            str(state.get("draft_explanation", "")),
+            str(state.get("draft_stressor", "NONE")),
+            False,
         )
-        return claims, expl, False
 
     if not state.get("allow_offline_mock", False):
         raise RuntimeError(
@@ -329,7 +368,7 @@ def _llm_or_fallback_synthesize(
     claims, expl = _deterministic_neuro_symbolic_synthesize(
         node_info, synapomorphies, stressor_diag, window_inspection, target_model
     )
-    return claims, expl, True
+    return claims, expl, tool_stressor, True
 
 
 # -----------------------------------------------------------------------------
@@ -429,8 +468,8 @@ def state_2_ancestral_extraction(state: DiagnosticAgentState) -> dict:
 
 def route_after_state_2(state: DiagnosticAgentState) -> str:
     """
-    Algorithm 1 Line 7:
-      if b_k not in B_true or mean_CI(synapomorphies) < 0.5 then
+    Algorithm 1 Line 6 (PDF Page 6):
+      if b_k not in B_true or mean_CI(synapomorphies) < 0.65 then
           route to State 3 (diagnose_evolutionary_stressor + inspect_alignment_window)
       else
           route directly to State 4 (Synthesize & Verify)
@@ -439,7 +478,7 @@ def route_after_state_2(state: DiagnosticAgentState) -> str:
     mean_ci = float(state.get("current_mean_ci", 1.0))
     is_discordant = current_node["topological_status"] != "CONCORDANT"
 
-    if is_discordant or mean_ci < 0.5:
+    if is_discordant or mean_ci < 0.65:
         return "state_3_stressor_interrogation"
     return "state_4_synthesize_and_verify"
 
@@ -490,11 +529,11 @@ def state_3_stressor_interrogation(state: DiagnosticAgentState) -> dict:
 def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
     """
     State 4 — Deterministic Self-Verification Gate:
-    Synthesizes draft biological claims and causal explanation, then verifies both
+    Synthesizes draft biological claims, stressor diagnosis, and causal explanation, then verifies both
     draft_claims AND explanation prose via Tool 5 (verify_claim_coordinates).
     Tracks node_committed explicitly so retry exhaustion terminates cleanly without loops.
     """
-    draft_claims, draft_explanation, used_mock = _llm_or_fallback_synthesize(state)
+    draft_claims, draft_explanation, draft_stressor, used_mock = _llm_or_fallback_synthesize(state)
     synapomorphies = state.get("current_synapomorphies", [])
 
     ver_res = verify_claim_coordinates(
@@ -517,6 +556,7 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
         return {
             "draft_claims": draft_claims,
             "draft_explanation": draft_explanation,
+            "draft_stressor": draft_stressor,
             "verification_result": ver_res,
             "retry_count": retry_count + 1,
             "node_committed": False,
@@ -537,7 +577,7 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
             "mean_ri": float(
                 a_true.get("mean_informative_ri", a_true["mean_alignment_ri"])
             ),
-            "lba_branch_ratio": float(a_true["global_rho_lba"]),
+            "lba_branch_ratio": 1.0,
             "gap_density_pct": float(a_true["mean_gap_density_pct"]),
             "recombination_window_overlap": False,
             "primary_artifact": "NONE",
@@ -548,7 +588,7 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
         node_info=current_node,
         draft_claims=draft_claims,
         draft_explanation=draft_explanation,
-        predicted_stressor=stressor_diag["primary_artifact"],
+        predicted_stressor=draft_stressor,
         true_branch_mutations=synapomorphies,
         true_stressor_diag=stressor_diag,
         fasta_path=state["fasta_path"],
@@ -572,6 +612,7 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
     return {
         "draft_claims": draft_claims,
         "draft_explanation": draft_explanation,
+        "draft_stressor": draft_stressor,
         "verification_result": final_ver_res,
         "node_audits": updated_audits,
         "branch_info_weights": updated_weights,
@@ -645,7 +686,7 @@ def finalize_audit_report(state: DiagnosticAgentState) -> dict:
     llm_label = (
         "OFFLINE_DETERMINISTIC_MOCK"
         if state.get("used_offline_mock", False)
-        else state.get("orchestrator_llm", "Qwen-2.5-32B-Instruct-Q4_K_M")
+        else state.get("orchestrator_llm", "qwen/qwen3-14b")
     )
 
     report_obj = AuditReport(
@@ -730,7 +771,7 @@ def run_diagnostic_audit(
     stressor_gt_path: str = "",
     output_json_path: str | None = None,
     support_threshold: float = 85.0,
-    orchestrator_llm: str = "Qwen-2.5-14B-Instruct-Q4_K_M",
+    orchestrator_llm: str = "qwen/qwen3-14b",
     lm_studio_base_url: str | None = None,
     require_live_llm: bool = False,
     allow_offline_mock: bool = False,

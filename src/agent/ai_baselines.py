@@ -305,6 +305,11 @@ def run_zero_shot_llm_baseline(
             try:
                 resp = llm.invoke(prompt)
                 content_str = resp.content if isinstance(resp.content, str) else str(resp.content)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Zero-Shot LLM query failed at {resolved_url} on node {nid}: {exc}"
+                ) from exc
+            try:
                 parsed = _extract_json_block(content_str)
                 draft_claims = list(parsed.get("draft_claims", []))
                 draft_explanation = str(parsed.get("explanation", f"Zero-shot audit of node {nid}."))
@@ -312,10 +317,9 @@ def run_zero_shot_llm_baseline(
                 raw_st = str(parsed.get("claimed_topological_status", claimed_status))
                 if raw_st in VALID_STATUSES:
                     claimed_status = raw_st
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Zero-Shot LLM query failed at {resolved_url} on node {nid}: {exc}"
-                ) from exc
+            except Exception:
+                draft_claims = []
+                draft_explanation = content_str.strip()[:300] or f"Malformed zero-shot output on {nid}."
         else:
             # Offline deterministic mock (unassisted visual column guess from first 120 cols without ASR tools)
             guessed_site = int(rng.integers(1, max(2, min(seq_len, 120))))
@@ -396,6 +400,49 @@ def run_zero_shot_llm_baseline(
     )
 
 
+def _select_most_informative_raw_window(
+    fasta_path: str, clade_taxa: list[str], window_width: int = 80
+) -> tuple[int, int]:
+    """
+    Scans raw alignment windows (using ONLY raw FASTA characters — zero M_true or A_true access)
+    to locate the window [start_pos, end_pos] with highest clade-vs-outgroup character variation,
+    so Baseline 2 is not artificially blind past column 80 on long alignments.
+    """
+    taxa_ids, char_mat, seq_len = load_alignment_data(fasta_path)
+    if seq_len <= window_width:
+        return 1, seq_len
+
+    clade_set = set(clade_taxa)
+    in_mask = np.array([tid in clade_set for tid in taxa_ids], dtype=bool)
+    out_mask = ~in_mask
+    if not np.any(in_mask) or not np.any(out_mask):
+        return 1, min(window_width, seq_len)
+
+    # Raw column polymorphism indicator (where modal in-clade state differs from modal out-clade state)
+    step = max(window_width // 2, 20)
+    best_start = 1
+    best_score = -1.0
+    for s0 in range(0, seq_len - window_width + 1, step):
+        e0 = min(seq_len, s0 + window_width)
+        win_in = char_mat[in_mask, s0:e0]
+        win_out = char_mat[out_mask, s0:e0]
+        # Count polymorphic columns in window
+        poly_cnt = 0
+        for off in range(e0 - s0):
+            c_in = set(win_in[:, off].tolist()) - {"?", "N", "X"}
+            c_out = set(win_out[:, off].tolist()) - {"?", "N", "X"}
+            if c_in and c_out and (len(c_in | c_out) > 1):
+                if c_in != c_out:
+                    poly_cnt += 2
+                else:
+                    poly_cnt += 1
+        if poly_cnt > best_score:
+            best_score = float(poly_cnt)
+            best_start = s0 + 1
+
+    return best_start, min(seq_len, best_start + window_width - 1)
+
+
 def run_generic_coding_agent_baseline(
     dataset_id: str,
     target_model: str,
@@ -414,10 +461,11 @@ def run_generic_coding_agent_baseline(
     seed: int = 42,
 ) -> dict:
     """
-    AI Baseline 2 (Generic Unconstrained Coding Agent):
-    Has basic topology & raw alignment window inspection (audit_tree_topology + inspect_alignment_window),
-    WITHOUT pre-computed ASR matrices (M_true), homoplasy/stressor calculators (A_true),
-    or the State 4 verify_claim_coordinates self-correction gate (Manuscript Section 4.3.1, Page 23).
+    AI Baseline 2 (Generic Unconstrained Window-Slicing Agent):
+    Given basic split metadata, Newick strings, and dynamic raw alignment window slicing
+    (inspect_alignment_window across [1..L]), WITHOUT pre-computed ASR matrices (M_true),
+    homoplasy/stressor calculators (A_true), pre-computed topological_status labels, or
+    the State 4 verify_claim_coordinates self-correction gate (PDF Section 6.3.1, pp. 7-8).
     """
     rng = np.random.default_rng(seed)
     topo_res = audit_tree_topology(
@@ -427,6 +475,8 @@ def run_generic_coding_agent_baseline(
         support_threshold=support_threshold,
         stressor_gt_path=stressor_gt_path,
     )
+    pred_nwk_str = Path(pred_newick_path).read_text().strip()
+    true_nwk_str = Path(true_newick_path).read_text().strip()
     taxa_ids, char_mat, seq_len = load_alignment_data(fasta_path)
     taxon_count = len(taxa_ids)
 
@@ -477,60 +527,77 @@ def run_generic_coding_agent_baseline(
         clade_taxa = node_info["clade_taxa"]
         sup = float(node_info["support_pct"])
 
-        # Generic agent inspects a fixed raw window [1..80] without M_true ASR or A_true homoplasy tools
+        # Dynamic raw window selection across [1..seq_len] without M_true ASR or A_true homoplasy tools
+        w_start, w_end = _select_most_informative_raw_window(
+            fasta_path=fasta_path,
+            clade_taxa=clade_taxa,
+            window_width=min(80, seq_len),
+        )
         win_info = inspect_alignment_window(
             fasta_path=fasta_path,
             taxa_subset=clade_taxa,
-            start_pos=1,
-            end_pos=min(80, seq_len),
+            start_pos=w_start,
+            end_pos=w_end,
         )
-        # Compact node summary without leaking internal T_true node IDs
+        # Basic split metadata ONLY (no pre-computed topological_status or T_true node IDs leaked)
         basic_node = {
             "node_id": nid,
             "clade_taxa": clade_taxa,
             "support_pct": sup,
-            "topological_status": node_info["topological_status"],
+            "sequence_length": seq_len,
         }
 
         draft_claims = []
         draft_explanation = ""
         pred_stressor = "NONE"
+        claimed_status = "CONCORDANT" if sup >= support_threshold else "DISCORDANT_LOW_SUPPORT"
 
         if llm is not None:
             prompt = (
-                "You are a Generic ReAct Coding Agent auditing a phylogenetic split (AI Baseline 2 — "
-                "basic tree & raw FASTA window inspection only; no ASR matrices, homoplasy calculators, or verification gate).\n"
+                "You are a Generic Unconstrained Window-Slicing Agent auditing a phylogenetic split (AI Baseline 2 — "
+                "basic split metadata & raw FASTA window slicing only; no ASR matrices, homoplasy calculators, or verification gate).\n"
                 "Confidence Tier Rubric: <50% = 'low confidence', 50% to <85% = 'moderate confidence', "
                 ">=85% = 'definitive high confidence' (state ONLY the single tier phrase matching this node's "
                 "bootstrap support—do not list the other rubric tiers).\n"
-                "Given the node info and raw FASTA window inspection [1..80] below, return ONLY a JSON object with keys:\n"
-                "1. \"primary_stressor\": one of [\"NONE\", \"LBA\", \"INDEL_GAP\", \"RECOMBINATION\", \"SHORT_BRANCH_HOMOPLASY\", \"SHORT_BRANCH_HOMOPLASY_AND_LBA\"]\n"
-                "2. \"draft_claims\": list of mutation objects observed in the window, each with keys "
+                f"Given the trees, split metadata, and raw FASTA window inspection [{w_start}..{w_end}] below, "
+                "determine whether this split is concordant or discordant with the Reference Tree Newick and return ONLY a JSON object with keys:\n"
+                "1. \"claimed_topological_status\": one of [\"CONCORDANT\", \"DISCORDANT_LOW_SUPPORT\", \"FALSE_CONFIDENCE_ERROR\"]\n"
+                "2. \"primary_stressor\": one of [\"NONE\", \"LBA\", \"INDEL_GAP\", \"RECOMBINATION\", \"SHORT_BRANCH_HOMOPLASY\", \"SHORT_BRANCH_HOMOPLASY_AND_LBA\"]\n"
+                "3. \"draft_claims\": list of mutation objects observed in the window, each with keys "
                 "{\"site_coordinate\": <int>, \"ancestral_state\": \"<char>\", \"derived_state\": \"<char>\", "
                 "\"posterior_probability\": 0.85, \"consistency_index_ci\": 0.8, \"is_indel\": <bool>}\n"
-                f"3. \"explanation\": a 1-2 sentence summary for node {nid} ({sup}% support).\n"
+                f"4. \"explanation\": a 1-2 sentence summary for node {nid} ({sup}% support).\n"
+                f"Predicted Tree Newick: {pred_nwk_str}\n"
+                f"Reference Tree Newick: {true_nwk_str}\n"
                 f"Node Info: {json.dumps(basic_node)}\n"
-                f"Window Inspection [1..80]: {json.dumps({'window_gap_pct': win_info['window_gap_pct'], 'polymorphic_sites': win_info['polymorphic_sites'][:10], 'window_slice': win_info['window_slice']})}\n"
+                f"Window Inspection [{w_start}..{w_end}]: {json.dumps({'start_pos': w_start, 'end_pos': w_end, 'window_gap_pct': win_info['window_gap_pct'], 'polymorphic_sites': win_info['polymorphic_sites'][:10], 'window_slice': win_info['window_slice']})}\n"
                 "/no_think"
             )
             try:
                 resp = llm.invoke(prompt)
                 content_str = resp.content if isinstance(resp.content, str) else str(resp.content)
-                parsed = _extract_json_block(content_str)
-                draft_claims = list(parsed.get("draft_claims", []))
-                draft_explanation = str(parsed.get("explanation", f"Generic agent audit of {nid}."))
-                pred_stressor = str(parsed.get("primary_stressor", "NONE"))
             except Exception as exc:
                 raise RuntimeError(
                     f"Generic Agent LLM query failed at {resolved_url} on node {nid}: {exc}"
                 ) from exc
+            try:
+                parsed = _extract_json_block(content_str)
+                draft_claims = list(parsed.get("draft_claims", []))
+                draft_explanation = str(parsed.get("explanation", f"Generic agent audit of {nid}."))
+                pred_stressor = str(parsed.get("primary_stressor", "NONE"))
+                raw_st = str(parsed.get("claimed_topological_status", claimed_status))
+                if raw_st in VALID_STATUSES:
+                    claimed_status = raw_st
+            except Exception:
+                draft_claims = []
+                draft_explanation = content_str.strip()[:300] or f"Malformed generic-agent output on {nid}."
         else:
-            # Offline deterministic mock: inspects polymorphic columns in raw window [1..80] without ASR posteriors
+            # Offline deterministic mock: inspects polymorphic columns in raw window [w_start..w_end] without ASR posteriors
             poly_sites = win_info.get("polymorphic_sites", [])
             chosen_site = (
                 int(poly_sites[0])
                 if poly_sites
-                else int(rng.integers(1, max(2, min(seq_len, 80))))
+                else int(rng.integers(w_start, max(w_start + 1, w_end + 1)))
             )
             clade_set = set(clade_taxa)
             in_chars = [
@@ -555,16 +622,17 @@ def run_generic_coding_agent_baseline(
                     "is_indel": "-" in {str(s_u), str(s_v)},
                 }
             ]
-            if node_info["topological_status"] == "CONCORDANT":
+            claimed_status = "CONCORDANT" if sup >= 60.0 else "DISCORDANT_LOW_SUPPORT"
+            if claimed_status == "CONCORDANT":
                 pred_stressor = "NONE"
             else:
                 pred_stressor = "INDEL_GAP" if win_info["window_gap_pct"] >= 15.0 else "SHORT_BRANCH_HOMOPLASY"
             draft_explanation = (
-                f"Generic agent inspected window [1..80] for {nid} ({sup}% support, {node_info['topological_status']}) "
+                f"Generic agent inspected window [{w_start}..{w_end}] for {nid} ({sup}% support, {claimed_status.lower()}) "
                 f"and flagged polymorphic site {chosen_site} ({s_u}->{s_v}) under {pred_stressor}."
             )
 
-        agent_claimed_statuses[nid] = node_info["topological_status"]
+        agent_claimed_statuses[nid] = claimed_status
         true_mutations, true_stressor_diag = _fetch_ground_truth_for_node(
             node_info=node_info,
             fasta_path=fasta_path,
