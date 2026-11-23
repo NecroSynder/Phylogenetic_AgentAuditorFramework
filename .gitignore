@@ -4,6 +4,7 @@
 # For user data
 data/
 external_models/
+presentation_assets/
 *.ini
 PROGRESS_PRESENTATION.md
 ### Python ###
