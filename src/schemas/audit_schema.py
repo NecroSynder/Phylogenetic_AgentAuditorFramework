@@ -1,4 +1,4 @@
-from typing import List, Literal
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 TargetModelName = Literal["Fusang", "Phyloformer", "IQ-TREE2", "RAxML-NG", "FastTree2"]
@@ -20,6 +20,8 @@ class GlobalMetrics(BaseModel):
     total_internal_nodes_audited: int = Field(..., ge=0)
     false_confidence_nodes_count: int = Field(..., ge=0)
     total_hallucination_retries_triggered: int = Field(default=0, ge=0)
+    gate_rescued_nodes_count: int = Field(default=0, ge=0)
+    pre_gate_ccvr: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     claim_to_coordinate_verification_rate: float = Field(..., ge=0.0, le=1.0)
     logical_consistency_rate_lcr: float = Field(..., ge=0.0, le=1.0)
     overall_tree_goodness_score: float = Field(..., ge=0.0, le=1.0)
@@ -33,6 +35,7 @@ class BayesianTransitionMetrics(BaseModel):
 
 class ExplanationQualityVector(BaseModel):
     ccvr_local: float = Field(..., ge=0.0, le=1.0)
+    pre_gate_ccvr_local: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     bsf_local: int = Field(..., ge=0, le=1)
     feature_f1: float = Field(..., ge=0.0, le=1.0)
     information_gain_ig: float = Field(..., ge=0.0, le=1.0)

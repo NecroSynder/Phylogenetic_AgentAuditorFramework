@@ -86,6 +86,11 @@ class DiagnosticAgentState(TypedDict, total=False):
     branch_info_weights: dict[str, float]
     total_claims_evaluated: int
     total_claims_verified: int
+    attempt0_ccvr_local: float | None
+    attempt0_all_verified: bool
+    attempt0_claims_evaluated: int
+    attempt0_claims_verified: int
+    gate_rescued_nodes_count: int
     used_offline_mock: bool
     audit_report: dict | None
 
@@ -334,8 +339,7 @@ def _llm_or_fallback_synthesize(
                     raise ValueError("Missing required keys ('draft_claims', 'explanation')")
                 raw_st = str(parsed.get("primary_stressor", "NONE")).strip().upper()
                 chosen_st = raw_st if raw_st in VALID_STRESSOR_LABELS else "NONE"
-                if is_concordant:
-                    chosen_st = "NONE"
+                # Do NOT overwrite live LLM stressor claims on concordant nodes; preserve symmetrically for LCR & EDR
                 return list(parsed["draft_claims"]), str(parsed["explanation"]), chosen_st, False
             except Exception as parse_exc:
                 # Malformed JSON from LLM should trigger State 4 self-correction retry (or fail CCVR cleanly on exhaustion)
@@ -407,6 +411,9 @@ def state_1_topological_triage(state: DiagnosticAgentState) -> dict:
         "branch_info_weights": {},
         "total_claims_evaluated": 0,
         "total_claims_verified": 0,
+        "attempt0_claims_evaluated": 0,
+        "attempt0_claims_verified": 0,
+        "gate_rescued_nodes_count": 0,
         "used_offline_mock": False,
     }
 
@@ -461,6 +468,8 @@ def state_2_ancestral_extraction(state: DiagnosticAgentState) -> dict:
         "current_mean_ci": round(mean_ci, 4),
         "current_stressor_diag": None,
         "current_window_inspection": None,
+        "attempt0_ccvr_local": None,
+        "attempt0_all_verified": True,
         "retry_count": 0,
         "node_committed": False,
     }
@@ -506,7 +515,11 @@ def state_3_stressor_interrogation(state: DiagnosticAgentState) -> dict:
         end_pos = min(seq_len, center_site + 15)
     else:
         a_true = load_json_dict(state["stressor_gt_path"])
-        recomb_bps = a_true.get("recombination_breakpoints") or []
+        recomb_bps = (
+            (a_true.get("detected_recombination_windows") or [])
+            if a_true.get("recombination_scan_performed", False)
+            else (a_true.get("recombination_breakpoints") or [])
+        )
         if recomb_bps:
             start_pos = max(1, int(recomb_bps[0][0]))
             end_pos = min(seq_len, start_pos + 30)
@@ -547,6 +560,22 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
     retry_count = int(state.get("retry_count", 0))
     max_retries = int(state.get("max_retries", 3))
 
+    # Capture Attempt-0 (pre-gate) verification totals to quantify State 4 Gate impact without extra LLM calls
+    a0_eval_total = int(state.get("attempt0_claims_evaluated", 0))
+    a0_ver_total = int(state.get("attempt0_claims_verified", 0))
+    a0_ccvr_local = state.get("attempt0_ccvr_local")
+    a0_all_verified = bool(state.get("attempt0_all_verified", True))
+    if retry_count == 0:
+        a0_e = int(ver_res.get("total_claims_evaluated", 0))
+        a0_v = int(ver_res.get("verified_claims_count", 0))
+        if a0_e == 0 and len(synapomorphies) > 0:
+            a0_e = 1
+            a0_v = 0
+        a0_eval_total += a0_e
+        a0_ver_total += a0_v
+        a0_ccvr_local = float(ver_res.get("ccvr_score", 0.0))
+        a0_all_verified = bool(ver_res.get("all_verified", False))
+
     if (not ver_res["all_verified"]) and retry_count < max_retries:
         nid_alert = state["current_node"]["node_id"]
         print(
@@ -558,6 +587,10 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
             "draft_explanation": draft_explanation,
             "draft_stressor": draft_stressor,
             "verification_result": ver_res,
+            "attempt0_ccvr_local": a0_ccvr_local,
+            "attempt0_all_verified": a0_all_verified,
+            "attempt0_claims_evaluated": a0_eval_total,
+            "attempt0_claims_verified": a0_ver_total,
             "retry_count": retry_count + 1,
             "node_committed": False,
             "used_offline_mock": bool(state.get("used_offline_mock", False) or used_mock),
@@ -596,6 +629,7 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
         asr_state_path=state["asr_state_path"],
         retry_count=retry_count,
         seq_len=seq_len,
+        pre_gate_ccvr_local=a0_ccvr_local,
     )
 
     updated_audits = list(state.get("node_audits", [])) + [node_record]
@@ -609,6 +643,8 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
         eval_cnt = 1
         ver_cnt = 0
 
+    rescued_inc = 1 if (retry_count > 0 and (not a0_all_verified) and bool(final_ver_res.get("all_verified", False))) else 0
+
     return {
         "draft_claims": draft_claims,
         "draft_explanation": draft_explanation,
@@ -618,6 +654,9 @@ def state_4_synthesize_and_verify(state: DiagnosticAgentState) -> dict:
         "branch_info_weights": updated_weights,
         "total_claims_evaluated": int(state.get("total_claims_evaluated", 0)) + eval_cnt,
         "total_claims_verified": int(state.get("total_claims_verified", 0)) + ver_cnt,
+        "attempt0_claims_evaluated": a0_eval_total,
+        "attempt0_claims_verified": a0_ver_total,
+        "gate_rescued_nodes_count": int(state.get("gate_rescued_nodes_count", 0)) + rescued_inc,
         "node_committed": True,
         "used_offline_mock": bool(state.get("used_offline_mock", False) or used_mock),
     }
@@ -650,6 +689,9 @@ def finalize_audit_report(state: DiagnosticAgentState) -> dict:
     node_audits = state.get("node_audits", [])
     tot_eval = int(state.get("total_claims_evaluated", 0))
     tot_ver = int(state.get("total_claims_verified", 0))
+    a0_eval = int(state.get("attempt0_claims_evaluated", 0))
+    a0_ver = int(state.get("attempt0_claims_verified", 0))
+    gate_rescued = int(state.get("gate_rescued_nodes_count", 0))
 
     if tot_eval > 0:
         global_ccvr = round(tot_ver / tot_eval, 4)
@@ -664,6 +706,18 @@ def finalize_audit_report(state: DiagnosticAgentState) -> dict:
         )
     else:
         global_ccvr = 1.0
+
+    if a0_eval > 0:
+        pre_gate_ccvr = round(a0_ver / a0_eval, 4)
+    elif node_audits:
+        pre_vals = [
+            float(n["explanation_quality_vector"]["pre_gate_ccvr_local"])
+            for n in node_audits
+            if n["explanation_quality_vector"].get("pre_gate_ccvr_local") is not None
+        ]
+        pre_gate_ccvr = round(float(np.mean(pre_vals)), 4) if pre_vals else global_ccvr
+    else:
+        pre_gate_ccvr = global_ccvr
 
     lcr_score = compute_lcr(node_audits, state["pred_newick_path"])
     g_tree = compute_tree_goodness(
@@ -705,6 +759,8 @@ def finalize_audit_report(state: DiagnosticAgentState) -> dict:
             total_internal_nodes_audited=len(node_audits),
             false_confidence_nodes_count=int(topo["false_confidence_nodes_count"]),
             total_hallucination_retries_triggered=total_retries,
+            gate_rescued_nodes_count=gate_rescued,
+            pre_gate_ccvr=pre_gate_ccvr,
             claim_to_coordinate_verification_rate=global_ccvr,
             logical_consistency_rate_lcr=lcr_score,
             overall_tree_goodness_score=g_tree,

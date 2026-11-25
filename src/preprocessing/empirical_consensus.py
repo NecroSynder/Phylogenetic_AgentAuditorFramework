@@ -260,6 +260,7 @@ def build_empirical_tier3_ground_truth(
     seq_type: str = "AUTO",
     consensus_support_threshold: float = 95.0,
     recombination_breakpoints: list | None = None,
+    auto_scan_recombination: bool | None = None,
     ufboot_replicates: int = 1000,
     raxml_bs_trees: int = 0,
     use_modelfinder: bool = True,
@@ -286,9 +287,18 @@ def build_empirical_tier3_ground_truth(
     if len(records) < 4:
         raise ValueError("Empirical alignment must contain at least 4 taxa.")
     taxa_names = sorted(rec.id for rec in records)
-    chosen_outgroup = (
-        outgroup if (outgroup and outgroup in taxa_names) else taxa_names[0]
-    )
+    if outgroup is not None:
+        if outgroup not in taxa_names:
+            raise ValueError(
+                f"Requested outgroup '{outgroup}' not found in {fasta_path} ({len(taxa_names)} taxa). "
+                "Refusing silent alphabetical fallback to protect ancestral polarity."
+            )
+        chosen_outgroup = outgroup
+    else:
+        chosen_outgroup = taxa_names[0]
+        print(
+            f"  [WARN] No outgroup supplied for {Path(fasta_path).name}; defaulting to '{chosen_outgroup}'."
+        )
 
     eng_res = run_three_classical_engines(
         fasta_path=fasta_path,
@@ -304,7 +314,8 @@ def build_empirical_tier3_ground_truth(
     rax_clades = eng_res["engine_clades"]["RAxML-NG"]
     ft_clades = eng_res["engine_clades"]["FastTree2"]
 
-    if published_tree_path and Path(published_tree_path).exists():
+    has_published_tree = bool(published_tree_path and Path(published_tree_path).exists())
+    if has_published_tree:
         pub_tree, pub_has_lengths = load_published_tree_safely(Path(published_tree_path).read_text())
         pub_tree.set_outgroup(pub_tree & chosen_outgroup)
         ref_clades: dict[tuple[str, ...], float] = {}
@@ -323,6 +334,7 @@ def build_empirical_tier3_ground_truth(
     consensus_clades = []
     silver_standard_splits: list[list[str]] = []
     discordant_or_weak_clades = []
+    fasttree_only_disagreements = []
 
     for leaves_tuple, _ in ref_clades.items():
         in_iq = leaves_tuple in iq_clades
@@ -332,6 +344,10 @@ def build_empirical_tier3_ground_truth(
         rax_sup = rax_clades.get(leaves_tuple, 0.0)
         ft_sup = ft_clades.get(leaves_tuple, 0.0)
         all_three_topologically_agree = in_iq and in_rax and in_ft
+        # When an independent published reference tree is supplied, both exact ML engines
+        # (IQ-TREE2 + RAxML-NG) corroborating the published split form 3 independent sources;
+        # approximate-ML FastTree2 LBA alone must not veto and mask true LBA splits in Stage B.
+        topo_corroborated = (in_iq and in_rax) if has_published_tree else all_three_topologically_agree
 
         support_candidates = []
         if ufboot_replicates >= 1000:
@@ -343,7 +359,7 @@ def build_empirical_tier3_ground_truth(
         min_sup = min(support_candidates) if support_candidates else 100.0
 
         meets_silver = bool(
-            all_three_topologically_agree and min_sup >= consensus_support_threshold
+            topo_corroborated and min_sup >= consensus_support_threshold
         )
         entry = {
             "clade_taxa": list(leaves_tuple),
@@ -354,15 +370,18 @@ def build_empirical_tier3_ground_truth(
             "fasttree_present": in_ft,
             "fasttree_support_pct": ft_sup,
             "all_three_engines_concordant": all_three_topologically_agree,
+            "exact_ml_corroborated_published": bool(has_published_tree and in_iq and in_rax),
             "meets_95pct_silver_standard": meets_silver,
         }
         if all_three_topologically_agree:
             consensus_clades.append(entry)
         else:
             discordant_or_weak_clades.append(entry)
+            if in_iq and in_rax and (not in_ft) and (ufboot_replicates < 1000 or iq_sup >= consensus_support_threshold):
+                fasttree_only_disagreements.append(entry)
 
         if meets_silver or (
-            ufboot_replicates < 1000 and all_three_topologically_agree
+            ufboot_replicates < 1000 and topo_corroborated
         ):
             silver_standard_splits.append(list(leaves_tuple))
 
@@ -372,13 +391,17 @@ def build_empirical_tier3_ground_truth(
     consensus_nwk_path = out_path / "T_consensus.nwk"
     consensus_nwk_path.write_text(reference_nwk_str + "\n")
 
+    # Run blind sequence-based sliding-window recombination scanning uniformly across all datasets
+    # (never peeking at expected_stressors or curated recombination_breakpoints, preventing oracle leakage into Tool 3).
+    do_auto_recomb = True if auto_scan_recombination is None else bool(auto_scan_recombination)
+
     run_ground_truth_pipeline(
         fasta_path=str(fasta_path),
         true_tree_path=str(consensus_nwk_path),
         out_dir=str(out_path),
         outgroup=chosen_outgroup,
         recombination_breakpoints=recombination_breakpoints or [],
-        auto_scan_recombination=(not bool(recombination_breakpoints)),
+        auto_scan_recombination=do_auto_recomb,
         expected_stressors=expected_stressors,
         verified_consensus_splits=silver_standard_splits,
         substitution_model=eng_res["best_fit_model"],
@@ -391,6 +414,23 @@ def build_empirical_tier3_ground_truth(
 
     total_internal = len(ref_clades)
     concordant_count = len(consensus_clades)
+    concordance_rate = round(concordant_count / max(total_internal, 1), 4)
+    low_concordance_warning = bool(
+        len(taxa_names) >= 8 and (len(silver_standard_splits) < 5 or concordance_rate < 0.40)
+    )
+    if low_concordance_warning:
+        print(
+            f"  [WARN] Low 3-engine consensus on {Path(fasta_path).name}: "
+            f"{len(silver_standard_splits)}/{total_internal} silver splits ({concordance_rate*100:.1f}%). "
+            "Check for gene-tree vs species-tree discordance (HGT/paralogy) before keeping in benchmark."
+        )
+    if fasttree_only_disagreements:
+        print(
+            f"  [WARN] FastTree2-only disagreement on {len(fasttree_only_disagreements)} split(s) "
+            f"agreed by published tree + IQ-TREE2 + RAxML-NG on {Path(fasta_path).name}; "
+            "compare unmasked Stage A metrics alongside masked consensus."
+        )
+
     summary = {
         "fasta_path": str(fasta_path),
         "reference_tree_source": reference_source,
@@ -400,9 +440,10 @@ def build_empirical_tier3_ground_truth(
         "total_internal_splits": total_internal,
         "three_engine_concordant_splits": concordant_count,
         "silver_standard_verified_splits": len(silver_standard_splits),
-        "three_engine_concordance_rate": round(
-            concordant_count / max(total_internal, 1), 4
-        ),
+        "three_engine_concordance_rate": concordance_rate,
+        "low_concordance_warning": low_concordance_warning,
+        "fasttree_only_disagreements_count": len(fasttree_only_disagreements),
+        "fasttree_only_disagreements": fasttree_only_disagreements,
         "consensus_support_threshold_pct": consensus_support_threshold,
         "consensus_clades": consensus_clades,
         "discordant_clades": discordant_or_weak_clades,

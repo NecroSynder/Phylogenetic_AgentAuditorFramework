@@ -69,11 +69,13 @@ def audit_tree_topology(
     pred_meta_path: str | None = None,
     support_threshold: float = 85.0,
     stressor_gt_path: str | None = None,
+    use_consensus_mask: bool = True,
 ) -> dict:
     """
     Compares every internal split b_k in B_pred against the ground-truth split set B_true.
-    Supports both synthetic absolute ground truths and Tier 3 empirical consensus split masks
-    (verified_consensus_splits in A_true.json; Manuscript Section 4.1.1.1.2).
+    Supports both synthetic/Tier-1 absolute ground truths and Tier 2/3 empirical consensus split masks
+    (verified_consensus_splits in A_true.json; Manuscript Section 4.1.1.1.2). Pass
+    use_consensus_mask=False to evaluate unmasked topology metrics against the full published T_true.
     """
     t_pred = load_ete_tree(pred_newick_path, fmt=1)
     t_true = load_ete_tree(true_newick_path, fmt=1)
@@ -81,14 +83,15 @@ def audit_tree_topology(
     resolved_meta_path = Path(pred_meta_path) if pred_meta_path else _infer_pred_meta_path(pred_newick_path)
     pred_meta = load_json_dict(resolved_meta_path) if (resolved_meta_path and resolved_meta_path.exists()) else None
 
-    # Check if Tier 3 empirical consensus mask is present in A_true.json
+    # Check if Tier 2/3 empirical consensus mask is present in A_true.json
     verified_splits_set: set[frozenset[str]] | None = None
-    gt_cand = Path(stressor_gt_path) if stressor_gt_path else (Path(true_newick_path).parent / "A_true.json")
-    if gt_cand.exists():
-        a_true_obj = load_json_dict(gt_cand)
-        raw_ver = a_true_obj.get("verified_consensus_splits")
-        if raw_ver is not None:
-            verified_splits_set = {frozenset(s) for s in raw_ver}
+    if use_consensus_mask:
+        gt_cand = Path(stressor_gt_path) if stressor_gt_path else (Path(true_newick_path).parent / "A_true.json")
+        if gt_cand.exists():
+            a_true_obj = load_json_dict(gt_cand)
+            raw_ver = a_true_obj.get("verified_consensus_splits")
+            if raw_ver is not None:
+                verified_splits_set = {frozenset(s) for s in raw_ver}
 
     b_pred = get_bipartition_dict(t_pred)
     b_true = get_bipartition_dict(t_true)
@@ -524,7 +527,12 @@ def diagnose_evolutionary_stressor(
     # Localized recombination enrichment check across [c_start, c_end]
     # Normalizes against background window width f_recomb so genome-wide uniform LBA
     # homoplasy does not falsely trigger RECOMBINATION by random Poisson overlap.
-    recomb_intervals = a_true.get("recombination_breakpoints") or []
+    # When blind sequence scanning ran (empirical corpus), read strictly detected_recombination_windows
+    # so human-curated documented_recombination_breakpoints never leak into Tool 3.
+    if a_true.get("recombination_scan_performed", False):
+        recomb_intervals = a_true.get("detected_recombination_windows") or []
+    else:
+        recomb_intervals = a_true.get("recombination_breakpoints") or []
     recomb_overlap = False
     recomb_hit_frac = 0.0
     if recomb_intervals and seq_len > 0:
@@ -727,8 +735,8 @@ def verify_claim_coordinates(
 
     for rec in source_records:
         s_pos = int(rec["site"])
-        p_st = str(rec["parent_state"])
-        c_st = str(rec["child_state"])
+        p_st = str(rec["parent_state"]).strip().upper()
+        c_st = str(rec["child_state"]).strip().upper()
         valid_sites.add(s_pos)
         valid_tuples.add((s_pos, p_st, c_st))
         if bool(rec.get("is_indel", False)):
@@ -744,8 +752,8 @@ def verify_claim_coordinates(
     unique_claims: list[dict] = []
     for claim in draft_claims:
         site = int(claim.get("site_coordinate", claim.get("site", -1)))
-        s_u = str(claim.get("ancestral_state", claim.get("parent_state", "")))
-        s_v = str(claim.get("derived_state", claim.get("child_state", "")))
+        s_u = str(claim.get("ancestral_state", claim.get("parent_state", ""))).strip().upper()
+        s_v = str(claim.get("derived_state", claim.get("child_state", ""))).strip().upper()
         key = (site, s_u, s_v)
         if key not in seen_keys:
             seen_keys.add(key)
@@ -757,8 +765,8 @@ def verify_claim_coordinates(
     for claim in unique_claims:
         total_evaluated += 1
         site = int(claim.get("site_coordinate", claim.get("site", -1)))
-        s_u = str(claim.get("ancestral_state", claim.get("parent_state", "")))
-        s_v = str(claim.get("derived_state", claim.get("child_state", "")))
+        s_u = str(claim.get("ancestral_state", claim.get("parent_state", ""))).strip().upper()
+        s_v = str(claim.get("derived_state", claim.get("child_state", ""))).strip().upper()
 
         if site < 1 or site > seq_len:
             mismatched.append({**claim, "reason": "Coordinate out of alignment bounds"})
@@ -785,7 +793,8 @@ def verify_claim_coordinates(
     if explanation_text:
         prose_sites, prose_muts = extract_prose_coordinate_claims(explanation_text)
         checked_prose_sites: set[int] = set()
-        for p_site, p_u, p_v in prose_muts:
+        for p_site, p_u_raw, p_v_raw in prose_muts:
+            p_u, p_v = str(p_u_raw).strip().upper(), str(p_v_raw).strip().upper()
             checked_prose_sites.add(p_site)
             if (p_site, p_u, p_v) not in seen_keys:
                 total_evaluated += 1

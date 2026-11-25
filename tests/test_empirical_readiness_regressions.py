@@ -664,3 +664,348 @@ def test_review_12_lingering_edge_cases(golden_toy_env, tmp_path: Path, monkeypa
         sparse_seq = txt.split(">SparseTaxon\n")[1].splitlines()[0]
         assert "A" in sparse_seq
 
+
+def test_anti_bias_safeguards_before_empirical_download(golden_toy_env, tmp_path: Path, monkeypatch) -> None:
+    """
+    Verifies all pre-download anti-bias safeguards:
+      1. Baseline 1 & 2 prompt parity (no 1-to-3 cap; identical confidence-tier/status/site checklist)
+      2. LCR O(K) scaling & strictly symmetric internal consistency (no C(K,2) >0.96 dilution,
+         no ground-truth accuracy smuggling, still flags non-laminar & status-vs-stressor errors)
+      3. Stage A dual masked + unmasked metrics & per-tier statistical breakdown + McNemar >=0.90 target
+      4. Attempt-0 pre-gate CCVR & gate_rescued_nodes_count + no silent live-LLM stressor override on concordant nodes
+      5. No documented_lba_taxa or documented_recombination_breakpoints leakage into Tool 3 +
+         case-insensitive coordinate verification + fail-fast outgroup & DNA N>40 guards
+    """
+    from src.evaluation.metrics import (
+        compute_lcr,
+        evaluate_stage_a_model_row,
+        run_replicate_statistical_suite,
+    )
+    from src.preprocessing.empirical_consensus import build_empirical_tier3_ground_truth
+
+    # 1. Baseline prompt parity
+    ab_src = Path("src/agent/ai_baselines.py").read_text()
+    assert "list of 1 to 3 observed site mutations" not in ab_src
+    assert ab_src.count("the matching confidence tier phrase from the rubric above") >= 2
+
+    # 2. LCR non-dilution on K=98 internal nodes (N=100 tree) & symmetric internal-consistency semantics
+    leaves = [f"T{i:03d}" for i in range(1, 101)]
+    caterpillar = f"{leaves[0]}:0.01"
+    for lf in leaves[1:]:
+        caterpillar = f"({caterpillar},{lf}:0.01):0.01"
+    big_nwk = tmp_path / "big100.nwk"
+    big_nwk.write_text(f"{caterpillar};\n")
+
+    # Build 98 valid nested clades where an agent internally contradicts itself on BOTH
+    # Predicate 2 (CONCORDANT + primary_stressor=LBA) and Predicate 3 (CONCORDANT + discordant/low-conf prose on 95%)
+    bad_records = []
+    claimed_bad = {}
+    for k in range(2, 100):
+        nid = f"N{k-1}"
+        bad_records.append(
+            {
+                "node_id": nid,
+                "predicted_clade_taxa": leaves[:k],
+                "model_support_pct": 95.0,
+                "topological_status": "FALSE_CONFIDENCE_ERROR",
+                "diagnosed_failure_mode": {
+                    "primary_stressor": "LBA",
+                    "agent_causal_explanation": f"Node {nid} is discordant with low confidence.",
+                },
+            }
+        )
+        claimed_bad[nid] = "CONCORDANT"
+    lcr_big_bad = compute_lcr(bad_records, str(big_nwk), agent_claimed_statuses=claimed_bad)
+    assert lcr_big_bad <= 0.35, f"Expected non-diluted LCR <= 0.35 on 98 contradicting nodes, got {lcr_big_bad}"
+
+    # Symmetric LCR check: asserting CONCORDANT + NONE + concordant high-conf prose is internally consistent (LCR=1.0)
+    # even if ground-truth topological_status differs (accuracy belongs to F1/IG/EDR, not LCR)
+    internally_consistent_wrong_acc = [
+        {
+            "node_id": "N1",
+            "predicted_clade_taxa": ["T001", "T002"],
+            "model_support_pct": 95.0,
+            "topological_status": "FALSE_CONFIDENCE_ERROR",
+            "diagnosed_failure_mode": {
+                "primary_stressor": "NONE",
+                "agent_causal_explanation": "Node N1 is concordant with 95.0% support (definitive high confidence).",
+            },
+        }
+    ]
+    assert compute_lcr(internally_consistent_wrong_acc, str(big_nwk), agent_claimed_statuses={"N1": "CONCORDANT"}) == 1.0
+
+    # Non-laminar clade conflict must still be penalized
+    non_laminar = [
+        {
+            "node_id": "N1",
+            "predicted_clade_taxa": ["T001", "T002"],
+            "model_support_pct": 95.0,
+            "topological_status": "CONCORDANT",
+            "diagnosed_failure_mode": {
+                "primary_stressor": "NONE",
+                "agent_causal_explanation": "Concordant split (definitive high confidence).",
+            },
+        },
+        {
+            "node_id": "N2",
+            "predicted_clade_taxa": ["T002", "T003"],
+            "model_support_pct": 95.0,
+            "topological_status": "CONCORDANT",
+            "diagnosed_failure_mode": {
+                "primary_stressor": "NONE",
+                "agent_causal_explanation": "Concordant split (definitive high confidence).",
+            },
+        },
+    ]
+    assert compute_lcr(non_laminar, str(big_nwk)) < 1.0
+
+    # 3. Stage A masked vs unmasked metrics (catches errors hidden when consensus mask drops a split)
+    nwk_str = Path(golden_toy_env["true_newick_path"]).read_text().strip()
+    disc_nwk = (
+        nwk_str.replace("Taxon_14", "__TMP__")
+        .replace("Taxon_08", "Taxon_14")
+        .replace("__TMP__", "Taxon_08")
+    )
+    disc_prefix = str(tmp_path / "disc_stage_a")
+    standardize_and_root_tree(disc_nwk, [disc_nwk] * 10, "Taxon_01", "Fusang", disc_prefix)
+
+    # Create a mask containing ONLY an empty split set so masked RF_norm collapses to 0, while unmasked stays > 0
+    masked_a_true = tmp_path / "masked_A_true.json"
+    base_a_true = json.loads(Path(golden_toy_env["stressor_gt_path"]).read_text())
+    base_a_true["verified_consensus_splits"] = []
+    masked_a_true.write_text(json.dumps(base_a_true))
+
+    row_a = evaluate_stage_a_model_row(
+        dataset_id="MASK_CHECK",
+        target_model="Fusang",
+        pred_newick_path=f"{disc_prefix}_normalized.nwk",
+        true_newick_path=golden_toy_env["true_newick_path"],
+        pred_meta_path=f"{disc_prefix}_metadata.json",
+        stressor_gt_path=str(masked_a_true),
+        tier_group="tier3",
+    )
+    assert row_a["rf_norm"] == 0.0
+    assert row_a["rf_norm_unmasked"] > 0.0
+    assert row_a["fci_global_unmasked"] > 0.0
+    assert row_a["tier_group"] == "tier3"
+
+    tier_rows = [
+        {
+            "dataset_id": f"T1_{i}",
+            "tier_group": "tier1",
+            "target_model": "Fusang",
+            "rf_norm": 0.30 + 0.01 * i,
+            "fci_global": 0.2,
+            "fci_conditional": 0.5,
+            "rf_norm_unmasked": 0.30 + 0.01 * i,
+            "fci_global_unmasked": 0.2,
+            "fci_conditional_unmasked": 0.5,
+        }
+        for i in range(6)
+    ] + [
+        {
+            "dataset_id": f"T1_{i}",
+            "tier_group": "tier1",
+            "target_model": "IQ-TREE2",
+            "rf_norm": 0.05 + 0.01 * i,
+            "fci_global": 0.0,
+            "fci_conditional": 0.0,
+            "rf_norm_unmasked": 0.05 + 0.01 * i,
+            "fci_global_unmasked": 0.0,
+            "fci_conditional_unmasked": 0.0,
+        }
+        for i in range(6)
+    ]
+    sa_suite = run_stage_a_statistical_suite(tier_rows)
+    assert "by_tier" in sa_suite and "tier1" in sa_suite["by_tier"]
+    assert "wilcoxon_rf_norm_unmasked" in sa_suite["Fusang"]["Fusang_vs_IQ-TREE2"]
+
+    # 4. Pre-gate Attempt-0 CCVR & gate_rescued_nodes_count
+    def hallucinating_attempt0(state):
+        return (
+            [{"site_coordinate": 9999, "ancestral_state": "A", "derived_state": "G"}],
+            "Hallucinated A9999G with 100.0% support (definitive high confidence).",
+        )
+
+    rep_gate = run_diagnostic_audit(
+        dataset_id="gate_ablation_check",
+        target_model="Fusang",
+        fasta_path=golden_toy_env["fasta_path"],
+        pred_newick_path=golden_toy_env["pred_newick_path"],
+        pred_meta_path=golden_toy_env["pred_meta_path"],
+        true_newick_path=golden_toy_env["true_newick_path"],
+        asr_state_path=golden_toy_env["asr_state_path"],
+        stressor_gt_path=golden_toy_env["stressor_gt_path"],
+        custom_synthesizer=hallucinating_attempt0,
+        max_retries=3,
+    )
+    assert rep_gate["global_metrics"]["pre_gate_ccvr"] == 0.0
+    assert rep_gate["global_metrics"]["claim_to_coordinate_verification_rate"] == 1.0
+    assert rep_gate["global_metrics"]["gate_rescued_nodes_count"] == 13
+
+    # 5a. documented_lba_taxa & documented_recombination_breakpoints isolated from Tool 3 (no oracle leakage)
+    gt_sep = tmp_path / "gt_no_leak"
+    a_sep = run_ground_truth_pipeline(
+        fasta_path=golden_toy_env["fasta_path"],
+        true_tree_path=golden_toy_env["raw_tree_path"],
+        out_dir=str(gt_sep),
+        outgroup="Taxon_01",
+        documented_lba_taxa=["Taxon_02"],  # normal short leaf; must NOT leak into long_branch_taxa
+        recombination_breakpoints=[[1, 900]],
+        auto_scan_recombination=True,
+    )
+    assert "Taxon_02" in a_sep["documented_lba_taxa"]
+    assert "Taxon_02" not in a_sep["long_branch_taxa"]
+    assert a_sep["recombination_scan_performed"] is True
+    assert a_sep["documented_recombination_breakpoints"] == [[1, 900]]
+    assert a_sep["detected_recombination_windows"] != [[1, 900]]
+    # Tool 3 reads blind detected_recombination_windows (not curated [[1, 900]])
+    diag_no_recomb_leak = diagnose_evolutionary_stressor(
+        fasta_path=golden_toy_env["fasta_path"],
+        pred_newick_path=str(gt_sep / "T_true_rooted.nwk"),
+        node_id="N1",
+        stressor_gt_path=str(gt_sep / "A_true.json"),
+    )
+    if not a_sep["detected_recombination_windows"]:
+        assert diag_no_recomb_leak["recombination_window_overlap"] is False
+
+    # Case-insensitive coordinate verification in verify_claim_coordinates
+    ver_lower = verify_claim_coordinates(
+        draft_claims=[{"site_coordinate": 88, "ancestral_state": "c", "derived_state": "a"}],
+        fasta_path=golden_toy_env["fasta_path"],
+        asr_state_path=golden_toy_env["asr_state_path"],
+        valid_branch_mutations=[{"site": 88, "parent_state": "C", "child_state": "A", "is_indel": False}],
+    )
+    assert ver_lower["all_verified"] is True
+
+    # McNemar >= 0.90 target threshold reported alongside >= 0.999
+    rep_suite = run_replicate_statistical_suite(
+        [{"g_tree": 0.95, "ccvr": 0.98, "bsf": 1.0} for _ in range(8)],
+        [{"g_tree": 0.20, "ccvr": 0.10, "bsf": 0.2} for _ in range(8)],
+    )
+    assert "mcnemar_ccvr_target_090" in rep_suite
+    assert rep_suite["mcnemar_ccvr_target_090"]["significant"] is True
+
+    # Standalone empirical_consensus fail-fast on invalid outgroup
+    with pytest.raises(ValueError, match="not found"):
+        build_empirical_tier3_ground_truth(
+            fasta_path=golden_toy_env["fasta_path"],
+            out_dir=str(tmp_path / "bad_og_standalone"),
+            outgroup="NONEXISTENT_TAXON",
+            ufboot_replicates=0,
+            use_modelfinder=False,
+        )
+
+    # Live LLM false-alarm primary_stressor on concordant node must NOT be silently overwritten to NONE
+    monkeypatch.setattr(
+        "src.agent.diagnostic_agent.resolve_lm_studio_url",
+        lambda url, timeout=3.0: ("http://mock-lmstudio:1234/v1", ["qwen/qwen3-14b"]),
+    )
+
+    class FalseAlarmConcordantChat:
+        def __init__(self, **kwargs):
+            pass
+
+        def invoke(self, prompt: str):
+            import re as _re
+
+            m_t2 = _re.search(r"Verified Clade Mutations \(Tool 2 Output\): (\[.*?\])\n", prompt)
+            syns = json.loads(m_t2.group(1)) if m_t2 else []
+            claims = [
+                {
+                    "site_coordinate": int(s["site"]),
+                    "ancestral_state": s["parent_state"],
+                    "derived_state": s["child_state"],
+                    "posterior_probability": float(s["posterior_prob"]),
+                    "consistency_index_ci": float(s["ci_score"]),
+                    "is_indel": bool(s["is_indel"]),
+                }
+                for s in syns[:1]
+            ]
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "draft_claims": claims,
+                        "primary_stressor": "LBA",
+                        "explanation": "Concordant split with 100.0% support (definitive high confidence).",
+                    }
+                )
+            )
+
+    import langchain_openai
+
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", FalseAlarmConcordantChat)
+    rep_fa = run_diagnostic_audit(
+        dataset_id="no_silent_stressor_override",
+        target_model="Fusang",
+        fasta_path=golden_toy_env["fasta_path"],
+        pred_newick_path=golden_toy_env["pred_newick_path"],
+        pred_meta_path=golden_toy_env["pred_meta_path"],
+        true_newick_path=golden_toy_env["true_newick_path"],
+        asr_state_path=golden_toy_env["asr_state_path"],
+        stressor_gt_path=golden_toy_env["stressor_gt_path"],
+        lm_studio_base_url="http://mock-lmstudio:1234/v1",
+        require_live_llm=True,
+        max_retries=1,
+    )
+    assert rep_fa["node_audits"][0]["diagnosed_failure_mode"]["primary_stressor"] == "LBA"
+    # Symmetric LCR Predicate 2 must penalize claiming CONCORDANT with primary_stressor=LBA
+    assert rep_fa["global_metrics"]["logical_consistency_rate_lcr"] < 1.0
+    # And EDR must penalize false concordant alarms
+    assert rep_fa["global_metrics"]["error_detection_rate_edr"] == 0.0
+
+    # 5b. Fail-fast outgroup & DNA N>40 guards in run_empirical_corpus.py
+    bad_raw = tmp_path / "bad_corpus"
+    no_og = bad_raw / "tier1" / "NO_OUTGROUP_DS"
+    no_og.mkdir(parents=True)
+    (no_og / "alignment.fa").write_text(Path(golden_toy_env["fasta_path"]).read_text())
+    (no_og / "T_true.nwk").write_text(Path(golden_toy_env["raw_tree_path"]).read_text())
+    (no_og / "dataset_metadata.json").write_text(json.dumps({"dataset_id": "NO_OUTGROUP_DS"}))
+
+    res_no_og = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_empirical_corpus.py",
+            "--raw-root",
+            str(bad_raw),
+            "--out-data-root",
+            str(tmp_path / "bad_out1"),
+            "--fail-fast",
+            "--offline-mock",
+            "--use-surrogate",
+            "--skip-classical-ml",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert res_no_og.returncode != 0
+    assert "outgroup_taxon" in (res_no_og.stderr + res_no_og.stdout)
+
+    dna45_raw = tmp_path / "dna45_corpus"
+    dna45_dir = dna45_raw / "tier2" / "DNA_N45_OOS"
+    dna45_dir.mkdir(parents=True)
+    (dna45_dir / "alignment.fa").write_text(
+        "".join(f">T{i:02d}\n{'ACGT'*80}\n" for i in range(1, 46))
+    )
+    (dna45_dir / "dataset_metadata.json").write_text(
+        json.dumps({"dataset_id": "DNA_N45_OOS", "outgroup_taxon": "T01"})
+    )
+    res_dna45 = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_empirical_corpus.py",
+            "--raw-root",
+            str(dna45_raw),
+            "--out-data-root",
+            str(tmp_path / "bad_out2"),
+            "--fail-fast",
+            "--offline-mock",
+            "--skip-classical-ml",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert res_dna45.returncode != 0
+    assert "N=45 > 40" in (res_dna45.stderr + res_dna45.stdout)
+
+

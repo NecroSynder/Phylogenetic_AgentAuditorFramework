@@ -3,6 +3,7 @@
 
 # For user data
 data/
+data_empirical/
 external_models/
 presentation_assets/
 *.ini

@@ -986,9 +986,14 @@ def run_ground_truth_pipeline(
         for leaf in t_true.iter_leaves()
         if leaf.name != outgroup and float(leaf.dist) >= max(median_leaf_len * 2.5, 0.10)
     }
-    if documented_lba_taxa:
-        detected_long_taxa.update(t for t in documented_lba_taxa if t in leaf_branch_lengths)
+    # Keep quantitative long_branch_taxa (read by Tool 3) strictly separate from literature-curated
+    # documented_lba_taxa (used only by post-hoc EDR scoring) to prevent oracle leakage into Tool 3.
     long_branch_taxa = sorted(detected_long_taxa)
+    curated_lba_taxa = (
+        sorted(t for t in documented_lba_taxa if t in leaf_branch_lengths)
+        if documented_lba_taxa
+        else []
+    )
 
     var_mask = s_arr > 0
     mean_inf_ci = float(np.mean(ci_arr[var_mask])) if np.any(var_mask) else 1.0
@@ -1013,12 +1018,14 @@ def run_ground_truth_pipeline(
         )
         g_idx += 1
 
-    recomb_list = list(recombination_breakpoints) if recombination_breakpoints else []
-    if not recomb_list and auto_scan_recombination:
-        recomb_list = detect_sliding_window_recombination_blocks(
+    documented_recomb = list(recombination_breakpoints) if recombination_breakpoints else []
+    detected_recomb: list[list[int]] = []
+    if auto_scan_recombination:
+        detected_recomb = detect_sliding_window_recombination_blocks(
             fasta_path=fasta_path,
             rooted_true_path=str(rooted_true_path),
         )
+    recomb_list = documented_recomb if documented_recomb else detected_recomb
 
     min_int_len = denom_min_int
     if expected_stressors is not None:
@@ -1057,6 +1064,7 @@ def run_ground_truth_pipeline(
         "leaf_branch_lengths": leaf_branch_lengths,
         "internal_branch_lengths": internal_branch_lengths,
         "long_branch_taxa": long_branch_taxa,
+        "documented_lba_taxa": curated_lba_taxa,
         "mean_alignment_ci": round(float(np.mean(ci_arr)), 4),
         "mean_informative_ci": round(mean_inf_ci, 4),
         "ensemble_ci": round(ensemble_ci, 4),
@@ -1067,6 +1075,9 @@ def run_ground_truth_pipeline(
         "max_gap_tract_length": max((t["l_gap"] for t in gap_tracts), default=0),
         "gap_tracts": gap_tracts,
         "branch_indel_synapomorphies": indel_boundaries_by_branch,
+        "recombination_scan_performed": bool(auto_scan_recombination),
+        "detected_recombination_windows": detected_recomb,
+        "documented_recombination_breakpoints": documented_recomb,
         "recombination_breakpoints": recomb_list,
         "expected_stressors": gt_stressors,
         "documented_clade_anomalies": documented_clade_anomalies or [],

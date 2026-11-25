@@ -115,9 +115,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Resumable Stage A + Stage B Empirical Corpus Runner (N = 45 Datasets)."
     )
-    parser.add_argument("--raw-root", default="data/01_raw_alignments")
+    parser.add_argument("--raw-root", default="data_empirical/01_raw_alignments")
     parser.add_argument("--manifest", default=None, help="Optional explicit empirical_manifest.json.")
-    parser.add_argument("--out-data-root", default="data", help="Root directory for 02_ground_truths, 03_standardized_trees, 04_audit_reports.")
+    parser.add_argument(
+        "--out-data-root",
+        default="data_empirical",
+        help="Root directory for 02_ground_truths, 03_standardized_trees, 04_audit_reports (isolated from synthetic data/).",
+    )
     parser.add_argument("--stage", choices=["A", "B", "both"], default="both")
     parser.add_argument("--bootstraps", type=int, default=100)
     parser.add_argument("--include-classical-ml", action="store_true", default=True)
@@ -137,6 +141,16 @@ def main() -> None:
     parser.add_argument("--offline-mock", action="store_true")
     parser.add_argument("--redo", action="store_true", help="Recompute outputs even if checkpoint files exist.")
     parser.add_argument("--fail-fast", action="store_true", help="Abort immediately on first dataset error instead of recording and continuing.")
+    parser.add_argument(
+        "--allow-alphabetical-outgroup-fallback",
+        action="store_true",
+        help="Allow fallback to sorted(taxa)[0] if outgroup_taxon is omitted/missing (disabled by default to prevent silent ingroup rooting).",
+    )
+    parser.add_argument(
+        "--strict-proposal-scope",
+        action="store_true",
+        help="Enforce strict Section 5.3 scope: fail on Tier 2/3 AA datasets with N <= 40 or Tier 2/3 datasets lacking published T_true.nwk.",
+    )
     args = parser.parse_args()
 
     data_root = Path(args.out_data_root)
@@ -169,17 +183,51 @@ def main() -> None:
         meta = item["meta"]
 
         try:
-            taxa_tup, _, _ = load_alignment_data(fa_path)
+            taxa_tup, _, seq_len = load_alignment_data(fa_path)
             n_taxa = len(taxa_tup)
             seq_alpha = detect_sequence_alphabet(str(fa_path))
             outgroup = meta.get("outgroup_taxon")
             if not outgroup or outgroup not in taxa_tup:
-                outgroup = sorted(taxa_tup)[0]
+                if args.allow_alphabetical_outgroup_fallback:
+                    outgroup = sorted(taxa_tup)[0]
+                    print(
+                        f"  [WARN] Dataset '{ds_id}' missing valid outgroup_taxon; falling back to '{outgroup}'."
+                    )
+                else:
+                    raise ValueError(
+                        f"Dataset '{ds_id}' is missing a valid 'outgroup_taxon' in dataset_metadata.json "
+                        f"(got {outgroup!r}, not found in {n_taxa} FASTA taxa). Refusing silent alphabetical "
+                        "fallback to prevent reversed ancestor->derived polarity."
+                    )
+
+            # Scope & model-compatibility guards BEFORE spending hours on ML/neural execution
+            if seq_alpha == "DNA" and n_taxa > 40 and not args.use_surrogate:
+                raise ValueError(
+                    f"Dataset '{ds_id}' is DNA with N={n_taxa} > 40 (exceeds Fusang's 40-taxon ceiling and "
+                    "incompatible with AA-only Phyloformer). Subsample to <=40 taxa or translate CDS to AA."
+                )
+            if seq_alpha == "DNA" and seq_len > 14000 and not args.use_surrogate:
+                raise ValueError(
+                    f"Dataset '{ds_id}' has DNA length L={seq_len} > 14,000 bp (exceeds Fusang's hardcoded "
+                    "length limit in fusang.py). Trim/select locus <= 10,000 bp."
+                )
+            if seq_alpha == "DNA" and (seq_len < 240 or seq_len > 10000):
+                print(
+                    f"  [WARN] DNA dataset '{ds_id}' has L={seq_len} bp outside Fusang's recommended [240, 10000] bp range."
+                )
+            if tier_grp in ("tier2", "tier3") and seq_alpha == "AA" and n_taxa <= 40:
+                msg_scope = (
+                    f"Dataset '{ds_id}' ({tier_grp}) is AA with N={n_taxa} <= 40 "
+                    "(Proposal Section 5.3 scopes Phyloformer outside Tier 1 to >40 protein taxa)."
+                )
+                if args.strict_proposal_scope:
+                    raise ValueError(msg_scope)
+                print(f"  [WARN] {msg_scope}")
 
             base_paths = DatasetPaths(dataset_id=ds_id, tier_group=tier_grp, root_dir=data_root)
             gt_dir = base_paths.ground_truth_dir
 
-            print(f"\n[{idx}/{len(datasets)}] Dataset={ds_id} ({tier_grp}, {seq_alpha}, N={n_taxa})")
+            print(f"\n[{idx}/{len(datasets)}] Dataset={ds_id} ({tier_grp}, {seq_alpha}, N={n_taxa}, L={seq_len})")
 
             # ------------------------------------------------------------------
             # STEP 1: GROUND-TRUTH INDEXING (Checkpointed)
@@ -195,6 +243,15 @@ def main() -> None:
                 if not tree_path.is_absolute() and (fa_path.parent / tree_path).exists():
                     tree_path = fa_path.parent / tree_path
 
+                if tier_grp in ("tier2", "tier3") and not tree_path.exists():
+                    msg_pub = (
+                        f"Dataset '{ds_id}' ({tier_grp}) has no published reference tree (T_true.nwk); "
+                        "falling back to IQ-TREE2_ModelFinder risks Stage A circularity."
+                    )
+                    if args.strict_proposal_scope:
+                        raise ValueError(msg_pub)
+                    print(f"  [WARN] {msg_pub}")
+
                 anc_fa = meta.get("experimental_ancestors_fasta")
                 if anc_fa and not Path(anc_fa).is_absolute() and (fa_path.parent / anc_fa).exists():
                     anc_fa = str(fa_path.parent / anc_fa)
@@ -209,6 +266,7 @@ def main() -> None:
                         outgroup=outgroup,
                         ufboot_replicates=0 if args.bootstraps <= 10 else 1000,
                         recombination_breakpoints=meta.get("recombination_breakpoints"),
+                        auto_scan_recombination=meta.get("auto_scan_recombination"),
                         published_tree_path=str(tree_path) if tree_path.exists() else None,
                         expected_stressors=meta.get("expected_stressors"),
                         documented_lba_taxa=meta.get("documented_lba_taxa") or meta.get("lba_long_taxa"),
@@ -224,6 +282,11 @@ def main() -> None:
                         out_dir=str(gt_dir),
                         outgroup=outgroup,
                         recombination_breakpoints=meta.get("recombination_breakpoints"),
+                        auto_scan_recombination=(
+                            True
+                            if meta.get("auto_scan_recombination") is None
+                            else bool(meta.get("auto_scan_recombination"))
+                        ),
                         expected_stressors=meta.get("expected_stressors"),
                         substitution_model=meta.get("substitution_model") or ("MFP" if args.bootstraps > 10 else None),
                         experimental_ancestors_fasta=anc_fa,
@@ -283,6 +346,7 @@ def main() -> None:
                                 true_newick_path=str(gt_dir / "T_true_rooted.nwk"),
                                 pred_meta_path=str(m_paths.normalized_metadata),
                                 stressor_gt_path=str(gt_dir / "A_true.json"),
+                                tier_group=tier_grp,
                             )
                         )
 

@@ -179,6 +179,8 @@ def _finalize_baseline_report(
             error_detection_rate_edr=edr_score,
             total_internal_nodes_audited=len(node_audits),
             false_confidence_nodes_count=int(topo_res["false_confidence_nodes_count"]),
+            gate_rescued_nodes_count=0,
+            pre_gate_ccvr=global_ccvr,
             claim_to_coordinate_verification_rate=global_ccvr,
             logical_consistency_rate_lcr=lcr_score,
             overall_tree_goodness_score=g_tree,
@@ -292,10 +294,12 @@ def run_zero_shot_llm_baseline(
                 "with the Reference Tree Newick, and return ONLY a valid JSON object with keys:\n"
                 "1. \"claimed_topological_status\": one of [\"CONCORDANT\", \"DISCORDANT_LOW_SUPPORT\", \"FALSE_CONFIDENCE_ERROR\"]\n"
                 "2. \"primary_stressor\": one of [\"NONE\", \"LBA\", \"INDEL_GAP\", \"RECOMBINATION\", \"SHORT_BRANCH_HOMOPLASY\", \"SHORT_BRANCH_HOMOPLASY_AND_LBA\"]\n"
-                "3. \"draft_claims\": list of 1 to 3 observed site mutations from the FASTA text supporting this split, each with keys:\n"
+                "3. \"draft_claims\": list of observed site mutations from the FASTA text supporting this split (up to 10 highest-confidence sites), each with keys:\n"
                 "   {\"site_coordinate\": <int 1-based column>, \"ancestral_state\": \"<char>\", \"derived_state\": \"<char>\", "
                 "\"posterior_probability\": 0.8, \"consistency_index_ci\": 0.8, \"is_indel\": <bool>}\n"
-                f"4. \"explanation\": a 1-2 sentence explanation for node {nid} ({sup}% support).\n"
+                f"4. \"explanation\": a 1-2 sentence biological causal explanation for node {nid} citing its exact "
+                f"bootstrap support percentage ({sup}%), the matching confidence tier phrase from the rubric above, "
+                "its claimed topological status, primary stressor (if discordant), and cited site coordinates.\n"
                 f"Target Model: {target_model}\n"
                 f"Predicted Tree Newick: {pred_nwk_str}\n"
                 f"Reference Tree Newick: {true_nwk_str}\n"
@@ -563,10 +567,12 @@ def run_generic_coding_agent_baseline(
                 "determine whether this split is concordant or discordant with the Reference Tree Newick and return ONLY a JSON object with keys:\n"
                 "1. \"claimed_topological_status\": one of [\"CONCORDANT\", \"DISCORDANT_LOW_SUPPORT\", \"FALSE_CONFIDENCE_ERROR\"]\n"
                 "2. \"primary_stressor\": one of [\"NONE\", \"LBA\", \"INDEL_GAP\", \"RECOMBINATION\", \"SHORT_BRANCH_HOMOPLASY\", \"SHORT_BRANCH_HOMOPLASY_AND_LBA\"]\n"
-                "3. \"draft_claims\": list of mutation objects observed in the window, each with keys "
+                "3. \"draft_claims\": list of observed site mutations in the window supporting this split (up to 10 highest-confidence sites), each with keys "
                 "{\"site_coordinate\": <int>, \"ancestral_state\": \"<char>\", \"derived_state\": \"<char>\", "
                 "\"posterior_probability\": 0.85, \"consistency_index_ci\": 0.8, \"is_indel\": <bool>}\n"
-                f"4. \"explanation\": a 1-2 sentence summary for node {nid} ({sup}% support).\n"
+                f"4. \"explanation\": a 1-2 sentence biological causal explanation for node {nid} citing its exact "
+                f"bootstrap support percentage ({sup}%), the matching confidence tier phrase from the rubric above, "
+                "its claimed topological status, primary stressor (if discordant), and cited site coordinates.\n"
                 f"Predicted Tree Newick: {pred_nwk_str}\n"
                 f"Reference Tree Newick: {true_nwk_str}\n"
                 f"Node Info: {json.dumps(basic_node)}\n"

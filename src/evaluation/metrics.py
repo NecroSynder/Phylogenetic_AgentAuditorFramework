@@ -495,9 +495,23 @@ def compute_lcr(
     total_predicates = 0
     contradictions = 0
 
-    for rec in node_audits:
+    # Precompute per-node laminar compatibility so denominator scales as O(K) rather than O(K^2)
+    # (preventing C(K, 2) tautological T_pred pairs from diluting LCR to >0.96 on large N>=100 trees).
+    clade_sets = [set(r["predicted_clade_taxa"]) for r in node_audits]
+    non_laminar_nodes: set[int] = set()
+    n_records = len(clade_sets)
+    for i in range(n_records):
+        c_i = clade_sets[i]
+        for j in range(i + 1, n_records):
+            c_j = clade_sets[j]
+            intersect = c_i & c_j
+            if intersect and not (c_i.issubset(c_j) or c_j.issubset(c_i)):
+                non_laminar_nodes.add(i)
+                non_laminar_nodes.add(j)
+
+    for idx, rec in enumerate(node_audits):
         nid = rec["node_id"]
-        claimed_clade = set(rec["predicted_clade_taxa"])
+        claimed_clade = clade_sets[idx]
         sup = float(rec["model_support_pct"])
         true_status = rec["topological_status"]
         asserted_status = (
@@ -508,21 +522,26 @@ def compute_lcr(
         prose = rec.get("diagnosed_failure_mode", {}).get("agent_causal_explanation", "")
         prose_lower = prose.lower()
 
-        # Predicate 1: Clade membership matches T_pred topology
+        # Predicate 1: Clade membership matches T_pred topology AND is laminar-compatible across all nodes
         total_predicates += 1
-        if nid in true_tree_clades and claimed_clade != true_tree_clades[nid]:
+        clade_mismatch = nid in true_tree_clades and claimed_clade != true_tree_clades[nid]
+        if clade_mismatch or (idx in non_laminar_nodes):
             contradictions += 1
 
-        # Predicate 2: Topological status vs support threshold consistency
+        # Predicate 2: Internal cross-field consistency (status vs. support cutoff & status vs. primary_stressor)
+        # Strictly symmetric across Proposed Agent & Baselines (never smuggles ground-truth accuracy into LCR).
         total_predicates += 1
+        pred_stressor = str(
+            rec.get("diagnosed_failure_mode", {}).get("primary_stressor", "NONE")
+        ).strip().upper()
         if asserted_status == "FALSE_CONFIDENCE_ERROR" and sup < 85.0:
             contradictions += 1
         elif asserted_status == "DISCORDANT_LOW_SUPPORT" and sup >= 85.0:
             contradictions += 1
-        elif asserted_status != true_status:
+        elif asserted_status == "CONCORDANT" and pred_stressor != "NONE":
             contradictions += 1
 
-        # Predicate 3: Prose status & confidence-tier internal consistency
+        # Predicate 3: Internal prose consistency vs. asserted status and bootstrap support tier
         total_predicates += 1
         claims_concordant_prose = bool(
             re.search(r"(?<!not\s)(?<!non-)(?<!in)\bconcordant\b", prose_lower)
@@ -533,9 +552,9 @@ def compute_lcr(
         has_high, _, has_low = _detect_confidence_tiers_in_text(prose)
 
         prose_contradiction = False
-        if true_status == "CONCORDANT" and claims_discordant_prose:
+        if asserted_status == "CONCORDANT" and claims_discordant_prose:
             prose_contradiction = True
-        elif true_status != "CONCORDANT" and claims_concordant_prose:
+        elif asserted_status != "CONCORDANT" and claims_concordant_prose:
             prose_contradiction = True
         elif sup >= 85.0 and has_low:
             prose_contradiction = True
@@ -544,17 +563,6 @@ def compute_lcr(
 
         if prose_contradiction:
             contradictions += 1
-
-    # Predicate 4: Pairwise clade Laminar / Hierarchical Compatibility on a tree
-    n_records = len(node_audits)
-    for i in range(n_records):
-        for j in range(i + 1, n_records):
-            c_i = set(node_audits[i]["predicted_clade_taxa"])
-            c_j = set(node_audits[j]["predicted_clade_taxa"])
-            total_predicates += 1
-            intersect = c_i & c_j
-            if intersect and not (c_i.issubset(c_j) or c_j.issubset(c_i)):
-                contradictions += 1
 
     if total_predicates == 0:
         return 1.0
@@ -680,8 +688,9 @@ def compute_report_edr(
         return 0.0 if false_concordant_alarms else 1.0
 
     a_true = load_json_dict(stressor_gt_path)
-    long_taxa = set(a_true.get("long_branch_taxa") or [])
-    recomb_bps = a_true.get("recombination_breakpoints") or []
+    # Prefer independent literature-documented LBA taxa & recombination intervals (isolated from Tool 3)
+    long_taxa = set(a_true.get("documented_lba_taxa") or a_true.get("long_branch_taxa") or [])
+    recomb_bps = a_true.get("documented_recombination_breakpoints") or a_true.get("recombination_breakpoints") or []
     gapped_pct = float(
         a_true.get("gapped_column_pct", a_true.get("mean_gap_density_pct", 0.0))
     )
@@ -835,6 +844,7 @@ def evaluate_single_node_audit(
     asr_state_path: str,
     retry_count: int = 0,
     seq_len: int | None = None,
+    pre_gate_ccvr_local: float | None = None,
 ) -> tuple[dict, dict, float]:
     """
     Single canonical node evaluation pipeline shared across Proposed 4-State Agent,
@@ -942,6 +952,7 @@ def evaluate_single_node_audit(
         bayesian_transition_metrics=BayesianTransitionMetrics(**bayes_metrics),
         explanation_quality_vector=ExplanationQualityVector(
             ccvr_local=ccvr_local,
+            pre_gate_ccvr_local=pre_gate_ccvr_local,
             bsf_local=bsf_local,
             feature_f1=f1_score,
             information_gain_ig=ig_local,
@@ -1089,6 +1100,14 @@ def run_replicate_statistical_suite(
     stats_map["mcnemar_ccvr_perfect"] = round(m_stat, 4)
     raw_pvals.append(m_pval)
 
+    # Proposal RQ1 / Section 5.3 target threshold (CCVR >= 0.90) avoids 0.999 cliff on large N>=100 trees
+    a_ccvr_90 = np.array([1 if float(r["ccvr"]) >= 0.90 else 0 for r in proposed_rows], dtype=int)
+    b_ccvr_90 = np.array([1 if float(r["ccvr"]) >= 0.90 else 0 for r in baseline_rows], dtype=int)
+    m90_stat, m90_pval = _mcnemar_from_binary_arrays(a_ccvr_90, b_ccvr_90)
+    metric_names.append("mcnemar_ccvr_target_090")
+    stats_map["mcnemar_ccvr_target_090"] = round(m90_stat, 4)
+    raw_pvals.append(m90_pval)
+
     if "bsf" in proposed_rows[0] and "bsf" in baseline_rows[0]:
         a_bsf_bin = np.array([1 if float(r["bsf"]) >= 0.999 else 0 for r in proposed_rows], dtype=int)
         b_bsf_bin = np.array([1 if float(r["bsf"]) >= 0.999 else 0 for r in baseline_rows], dtype=int)
@@ -1135,43 +1154,66 @@ def evaluate_stage_a_model_row(
     pred_meta_path: str | None = None,
     stressor_gt_path: str | None = None,
     support_threshold: float = 85.0,
+    tier_group: str | None = None,
 ) -> dict:
-    """Computes Stage A topological & false-confidence metrics (RF_norm, FCI_global, FCI_cond) for a standardized tree."""
-    topo = audit_tree_topology(
+    """
+    Computes Stage A topological & false-confidence metrics (RF_norm, FCI_global, FCI_cond)
+    both under the proposal's 3-engine consensus mask (when present on Tiers 2-3) AND unmasked
+    against the full published T_true.nwk (eliminating ML self-grading circularity & FastTree2 LBA masking).
+    """
+    topo_masked = audit_tree_topology(
         pred_newick_path=pred_newick_path,
         true_newick_path=true_newick_path,
         pred_meta_path=pred_meta_path,
         support_threshold=support_threshold,
         stressor_gt_path=stressor_gt_path,
+        use_consensus_mask=True,
     )
-    return {
+    topo_unmasked = audit_tree_topology(
+        pred_newick_path=pred_newick_path,
+        true_newick_path=true_newick_path,
+        pred_meta_path=pred_meta_path,
+        support_threshold=support_threshold,
+        stressor_gt_path=stressor_gt_path,
+        use_consensus_mask=False,
+    )
+    row = {
         "dataset_id": dataset_id,
         "target_model": target_model,
-        "rf_norm": float(topo["normalized_rf_distance"]),
-        "fci_global": float(topo["fci_global"]),
-        "fci_conditional": float(topo["fci_conditional"]),
-        "total_internal_nodes": int(topo["total_internal_nodes"]),
-        "false_confidence_nodes_count": int(topo["false_confidence_nodes_count"]),
+        "rf_norm": float(topo_masked["normalized_rf_distance"]),
+        "fci_global": float(topo_masked["fci_global"]),
+        "fci_conditional": float(topo_masked["fci_conditional"]),
+        "rf_norm_unmasked": float(topo_unmasked["normalized_rf_distance"]),
+        "fci_global_unmasked": float(topo_unmasked["fci_global"]),
+        "fci_conditional_unmasked": float(topo_unmasked["fci_conditional"]),
+        "total_internal_nodes": int(topo_masked["total_internal_nodes"]),
+        "false_confidence_nodes_count": int(topo_masked["false_confidence_nodes_count"]),
+        "false_confidence_nodes_count_unmasked": int(topo_unmasked["false_confidence_nodes_count"]),
         "pred_newick_path": str(pred_newick_path),
     }
+    if tier_group is not None:
+        row["tier_group"] = str(tier_group)
+    return row
 
 
-def run_stage_a_statistical_suite(
+def _run_stage_a_suite_on_rows(
     stage_a_rows: list[dict],
     alpha: float = 0.05,
 ) -> dict:
-    """
-    Executes Stage A paired two-sided Wilcoxon signed-rank tests with Benjamini-Hochberg FDR correction
-    comparing Neural Target Models (Fusang, Phyloformer) against Classical ML References
-    (IQ-TREE2, RAxML-NG, FastTree2) on RF_norm, FCI_global, and FCI_conditional (PDF Section 6.3.1, p. 8).
-    """
     by_model_ds: dict[str, dict[str, dict]] = {}
     for row in stage_a_rows:
         by_model_ds.setdefault(str(row["target_model"]), {})[str(row["dataset_id"])] = row
 
     neural_models = ["Fusang", "Phyloformer"]
     ml_references = ["IQ-TREE2", "RAxML-NG", "FastTree2"]
-    metrics_to_test = ["rf_norm", "fci_global", "fci_conditional"]
+    candidate_metrics = [
+        "rf_norm",
+        "fci_global",
+        "fci_conditional",
+        "rf_norm_unmasked",
+        "fci_global_unmasked",
+        "fci_conditional_unmasked",
+    ]
 
     suite: dict[str, Any] = {}
     for n_mod in neural_models:
@@ -1188,6 +1230,11 @@ def run_stage_a_statistical_suite(
             shared_ds = sorted(set(n_map.keys()) & set(ml_map.keys()))
             if len(shared_ds) < 2:
                 continue
+            metrics_to_test = [
+                m_key
+                for m_key in candidate_metrics
+                if all(m_key in n_map[d] and m_key in ml_map[d] for d in shared_ds)
+            ]
             for m_key in metrics_to_test:
                 a_vec = np.array([float(n_map[d][m_key]) for d in shared_ds], dtype=float)
                 b_vec = np.array([float(ml_map[d][m_key]) for d in shared_ds], dtype=float)
@@ -1226,4 +1273,28 @@ def run_stage_a_statistical_suite(
                 }
             suite[n_mod] = mod_summary
 
+    return suite
+
+
+def run_stage_a_statistical_suite(
+    stage_a_rows: list[dict],
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Executes Stage A paired two-sided Wilcoxon signed-rank tests with Benjamini-Hochberg FDR correction
+    comparing Neural Target Models (Fusang, Phyloformer) against Classical ML References
+    (IQ-TREE2, RAxML-NG, FastTree2) on both masked consensus and unmasked published-tree metrics
+    (overall and stratified by tier_group when present; PDF Section 6.3.1, p. 8).
+    """
+    suite = _run_stage_a_suite_on_rows(stage_a_rows, alpha=alpha)
+    tiers_present = sorted({str(r["tier_group"]) for r in stage_a_rows if r.get("tier_group")})
+    if tiers_present:
+        by_tier: dict[str, Any] = {}
+        for tg in tiers_present:
+            sub_rows = [r for r in stage_a_rows if str(r.get("tier_group")) == tg]
+            sub_res = _run_stage_a_suite_on_rows(sub_rows, alpha=alpha)
+            if sub_res:
+                by_tier[tg] = sub_res
+        if by_tier:
+            suite["by_tier"] = by_tier
     return suite

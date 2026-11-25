@@ -120,6 +120,11 @@ def _extract_summary_row(
         "rf_norm": float(gm["normalized_rf_distance"]),
         "fci_global": float(gm["false_confidence_index_fci"]),
         "conditional_fci": float(gm.get("conditional_fci", 0.0)),
+        "pre_gate_ccvr": float(
+            gm["pre_gate_ccvr"]
+            if gm.get("pre_gate_ccvr") is not None
+            else gm["claim_to_coordinate_verification_rate"]
+        ),
         "ccvr": float(gm["claim_to_coordinate_verification_rate"]),
         "bsf": mean_bsf,
         "lcr": float(gm["logical_consistency_rate_lcr"]),
@@ -134,6 +139,7 @@ def _extract_summary_row(
         "total_hallucination_retries_triggered": int(
             gm.get("total_hallucination_retries_triggered", 0)
         ),
+        "gate_rescued_nodes_count": int(gm.get("gate_rescued_nodes_count", 0)),
         "report_json_path": str(json_path),
     }
 
@@ -148,6 +154,7 @@ def _upsert_master_tsv(tsv_path: Path, new_rows: list[dict]) -> pd.DataFrame:
         "rf_norm",
         "fci_global",
         "conditional_fci",
+        "pre_gate_ccvr",
         "ccvr",
         "bsf",
         "lcr",
@@ -160,12 +167,14 @@ def _upsert_master_tsv(tsv_path: Path, new_rows: list[dict]) -> pd.DataFrame:
         "total_internal_nodes_audited",
         "false_confidence_nodes_count",
         "total_hallucination_retries_triggered",
+        "gate_rescued_nodes_count",
         "report_json_path",
     ]
     int_cols = {
         "total_internal_nodes_audited",
         "false_confidence_nodes_count",
         "total_hallucination_retries_triggered",
+        "gate_rescued_nodes_count",
     }
     new_df = pd.DataFrame(new_rows)
     for c in cols:
