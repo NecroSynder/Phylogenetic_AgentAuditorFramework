@@ -2,6 +2,7 @@
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,visualstudiocode
 
 # For user data
+data_empirical_pilot/
 data/
 data_empirical/
 external_models/
